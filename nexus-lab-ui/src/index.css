@@ -1,0 +1,26 @@
+@import "tailwindcss";
+@config "../tailwind.config.js";
+
+@layer base {
+    html.dark body {
+        background-color: #0f172a;
+        color: #f8fafc;
+    }
+}
+
+/* Hard override to ensure dark mode works even if variant generation fails */
+html.dark .dark\:bg-slate-900 {
+    background-color: #0f172a !important;
+}
+
+html.dark .dark\:text-white {
+    color: #ffffff !important;
+}
+
+html.dark .dark\:bg-slate-800 {
+    background-color: #1e293b !important;
+}
+
+html.dark .dark\:border-slate-700 {
+    border-color: #334155 !important;
+}

@@ -1,0 +1,494 @@
+"""
+Backend for 3B Model Training and Inference.
+This implementation provides the logic for local model management,
+real-time training metrics, and human-in-the-loop scoring.
+"""
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import time
+import random
+import uuid
+import threading
+import os
+import gc
+import json
+
+app = FastAPI(title="Nexus 3B Backend")
+
+# Enable CORS for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Internal State ---
+
+class EngineState:
+    def __init__(self):
+        self.is_training = False
+        self.metrics = {"loss": 0.0, "step": 0, "perplexity": 0.0}
+        self.knowledge_base = []
+        self.feedback_log = []
+        # Model state
+        self.model = None
+        self.tokenizer = None
+        self.model_name = None
+        self.adapter_loaded = False
+        self.active_adapter = None
+        # Default system prompt
+        self.system_prompt = "You are a helpful AI assistant."
+
+        
+        # Loading state
+        self.loading_status = "idle" # idle, downloading, loading, ready, error
+        self.loading_progress = 0.0 # 0-100
+        self.loading_error = ""
+        
+        # Settings
+        # Default to 'models' directory in the current working directory
+        self.cache_dir = os.path.join(os.getcwd(), "models")
+        
+        # Inference Parameters
+        self.params = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_new_tokens": 200
+        }
+
+state = EngineState()
+
+# --- Schemas ---
+
+class ChatRequest(BaseModel):
+    message: str
+
+class ScoreRequest(BaseModel):
+    message_id: str
+    score: int
+    prompt: str = ""
+    response: str = ""
+
+@app.post("/v1/score")
+async def submit_score(request: ScoreRequest):
+    """
+    Records human feedback. 
+    If score >= 7 and prompt/response are provided, appends to training_data.jsonl.
+    """
+    print(f"DEBUG SCORE REQUEST: {request}")
+    # Log the raw feedback
+    state.feedback_log.append({
+        "id": request.message_id,
+        "score": request.score,
+        "timestamp": time.time()
+    })
+    
+    saved = False
+    if request.score >= 7 and request.prompt and request.response:
+        entry = {
+            "prompt": request.prompt,
+            "response": request.response,
+            "score": request.score,
+            "source": "human_feedback"
+        }
+        try:
+            with open("training_data.jsonl", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            saved = True
+        except Exception as e:
+            print(f"Failed to save training data: {e}")
+            
+    return {"status": "Score accepted", "saved_for_training": saved}
+
+class LoadModelRequest(BaseModel):
+    model_id: str
+
+class SettingsRequest(BaseModel):
+    cache_dir: str
+
+class ModelParamsRequest(BaseModel):
+    temperature: float
+    top_p: float
+    max_new_tokens: int
+
+class LoadAdapterRequest(BaseModel):
+    system_prompt: str = ""
+
+
+
+# --- Logic: Training Loop ---
+
+# Import the training module (Make sure dependencies are installed)
+try:
+    import train as train_module
+except ImportError:
+    train_module = None
+
+import subprocess
+import sys
+
+def real_training_loop(model_id):
+    """
+    Executes the real training process in a separate SUBPROCESS.
+    This ensures proper memory reclamation (OS kills the process).
+    """
+    state.is_training = True
+    state.metrics = {"loss": 0.0, "step": 0, "perplexity": 0.0, "status": "Starting..."}
+    
+    print(f"Starting Real Training (Subprocess) for {model_id}...")
+    
+    # Run train.py as a separate process
+    # python train.py --model_id "..." --data "..."
+    cmd = [sys.executable, "train.py", "--model_id", model_id]
+    
+    try:
+        # Use Popen to stream stdout
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # Merge stderr to stdout for capturing errors too
+            text=True,
+            bufsize=1,
+            cwd=os.getcwd()
+        )
+        
+        # Stream output
+        for line in process.stdout:
+            line = line.strip()
+            if not line: continue
+            
+            # Check for our special JSON marker
+            if line.startswith("JSON_LOG:"):
+                try:
+                    json_str = line[len("JSON_LOG:"):]
+                    logs = json.loads(json_str)
+                    
+                    if "loss" in logs:
+                        state.metrics["loss"] = logs["loss"]
+                        state.metrics["perplexity"] = 2.718 ** logs["loss"]
+                    if "epoch" in logs:
+                        state.metrics["step"] = logs["epoch"]
+                        
+                except:
+                    pass
+            # Also capture status from normal logs if useful, or just print them
+            print(f"[TRAIN]: {line}")
+            
+            # Update status for user feedback based on simple keywords
+            if "Loading Model" in line:
+                 state.metrics["status"] = "Loading Model..."
+            elif "Tokenizing" in line:
+                 state.metrics["status"] = "Tokenizing..."
+            elif "Saving adapters" in line:
+                 state.metrics["status"] = "Saving Weights..."
+
+        # Wait for finish
+        ret_code = process.wait()
+        
+        if ret_code == 0:
+            state.metrics["status"] = "Complete"
+            print("Training subprocess finished successfully.")
+        else:
+            state.metrics["status"] = "Failed"
+            print(f"Training subprocess failed with code {ret_code}")
+            
+    except Exception as e:
+        print(f"Training launch failed: {e}")
+        state.metrics["status"] = f"Error: {str(e)}"
+    
+    state.is_training = False
+
+# --- Endpoints ---
+
+def _background_model_load(model_id: str):
+    """Background task to load model."""
+    global state
+    try:
+        print(f"Starting background load for {model_id}")
+        state.loading_status = "downloading"
+        state.loading_progress = 10.0
+        
+        # Determine device first
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+            
+        state.loading_progress = 20.0
+        
+        # Load Tokenizer
+        print(f"Loading tokenizer (cache: {state.cache_dir})...")
+        state.tokenizer = AutoTokenizer.from_pretrained(
+            model_id, 
+            cache_dir=state.cache_dir,
+            trust_remote_code=True
+        )
+        state.loading_progress = 40.0
+        
+        # Load Model
+        print(f"Loading model on {device} (cache: {state.cache_dir})...")
+        state.loading_status = "loading"
+        state.model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+            device_map=device,
+            cache_dir=state.cache_dir,
+            trust_remote_code=True
+        )
+        state.model_name = model_id
+        
+        state.loading_progress = 100.0
+        state.loading_status = "ready"
+        print(f"Model {model_id} ready.")
+        
+    except Exception as e:
+        print(f"Error in background load: {e}")
+        state.loading_status = "error"
+        state.loading_error = str(e)
+
+@app.post("/v1/model/load")
+async def load_model_handler(request: LoadModelRequest, background_tasks: BackgroundTasks):
+    """Triggers background model loading."""
+    if state.loading_status in ["downloading", "loading"]:
+        raise HTTPException(status_code=400, detail="Model already loading.")
+    
+    # Reset state
+    state.loading_status = "starting"
+    state.loading_progress = 0.0
+    state.loading_error = ""
+    
+    background_tasks.add_task(_background_model_load, request.model_id)
+    return {"status": "Loading started", "model": request.model_id}
+
+@app.get("/v1/model/status")
+async def get_model_status():
+    return {
+        "status": state.loading_status,
+        "progress": state.loading_progress,
+        "error": state.loading_error,
+        "current_model": state.model_name,
+        "active_adapter": state.active_adapter,
+        "adapter_loaded": state.adapter_loaded
+    }
+
+@app.post("/v1/model/unload")
+async def unload_model():
+    """Unloads the model and frees memory."""
+    if state.model is None:
+        return {"status": "No model to unload"}
+        
+    print("Unloading model...")
+    state.model = None
+    state.tokenizer = None
+    state.model_name = None
+    state.loading_status = "idle"
+    state.loading_progress = 0.0
+    
+    # Force Garbage Collection
+    gc.collect()
+    
+    # Clear CUDA Cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print("CUDA cache cleared.")
+    
+    # Clear MPS Cache (if applicable/available in future PyTorch versions)
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.empty_cache()
+            print("MPS cache cleared.")
+        except:
+             pass 
+
+    print("Model unloaded successfully.")
+    print("Model unloaded successfully.")
+    return {"status": "Model unloaded"}
+
+@app.post("/v1/adapter/load")
+async def load_adapter_handler(request: LoadAdapterRequest):
+    """Loads the fine-tuned adapter from nexus_adapters."""
+    if not state.model:
+        raise HTTPException(status_code=400, detail="Base model not loaded.")
+    
+    adapter_path = "nexus_adapters"
+    if not os.path.exists(adapter_path):
+        raise HTTPException(status_code=404, detail=f"Adapter path '{adapter_path}' not found. Please train first.")
+
+    try:
+        print(f"Loading Adapter from {adapter_path}...")
+        # Check if already peft model, if so, unload first?
+        # Simpler: Just wrap. PeftModel.from_pretrained works on top of base model.
+        state.model = PeftModel.from_pretrained(state.model, adapter_path)
+        state.adapter_loaded = True
+        state.active_adapter = "Nexus Adapter (LoRA)"
+        # FORCE PERSONA: Use provided prompt or default AI persona
+        state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
+        print(f"Adapter loaded. System Prompt: {state.system_prompt}")
+        return {"status": "Adapter loaded", "adapter": state.active_adapter}
+    except Exception as e:
+        print(f"Error loading adapter: {e}")
+        state.adapter_loaded = False
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/adapter/unload")
+async def unload_adapter_handler():
+    """Unloads the adapter (reverts to base model)."""
+    if not state.adapter_loaded or not state.model:
+        return {"status": "No adapter active"}
+
+    try:
+        print("Unloading adapter...")
+        # PeftModel has 'unload()' or 'disable_adapter()'
+        # To permanently unload: model = model.unload()
+        if hasattr(state.model, "unload"):
+             state.model = state.model.unload()
+        
+        state.adapter_loaded = False
+        state.active_adapter = None
+        state.system_prompt = "You are a helpful AI assistant." # Reset
+        return {"status": "Adapter unloaded"}
+    except Exception as e:
+        print(f"Error unloading adapter: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/settings/update")
+async def update_settings(request: SettingsRequest):
+    # If empty, revert to default 'models' directory
+    default_path = os.path.join(os.getcwd(), "models")
+    state.cache_dir = request.cache_dir if request.cache_dir.strip() else default_path
+    print(f"Cache dir updated to: {state.cache_dir}")
+    return {"status": "Settings updated", "cache_dir": state.cache_dir}
+
+@app.get("/v1/settings/get")
+async def get_settings():
+    return {"cache_dir": state.cache_dir or ""}
+
+@app.get("/v1/model/list")
+async def list_models():
+    """Lists downloaded models in the cache directory."""
+    if not state.cache_dir or not os.path.exists(state.cache_dir):
+        return {"models": []}
+    
+    models = []
+    try:
+        for folder in os.listdir(state.cache_dir):
+            if folder.startswith("models--"):
+                # Parse "models--org--repo" -> "org/repo"
+                parts = folder.split("--")
+                if len(parts) >= 3:
+                    org = parts[1]
+                    repo = parts[2]
+                    models.append(f"{org}/{repo}")
+    except Exception as e:
+        print(f"Error listing models: {e}")
+        
+    return {"models": models}
+
+@app.post("/v1/parameters/update")
+async def update_parameters(request: ModelParamsRequest):
+    state.params["temperature"] = request.temperature
+    state.params["top_p"] = request.top_p
+    state.params["max_new_tokens"] = request.max_new_tokens
+    print(f"Parameters updated: {state.params}")
+    return {"status": "Parameters updated", "params": state.params}
+
+@app.get("/v1/parameters/get")
+async def get_parameters():
+    return {"params": state.params}
+
+@app.post("/v1/chat")
+async def chat_handler(request: ChatRequest):
+    """
+    Handles inference. Uses local model if loaded, otherwise falls back to mock.
+    """
+    msg_id = str(uuid.uuid4())
+    
+    # 1. Fallback if no model loaded
+    if not state.model or not state.tokenizer:
+        return {
+            "id": msg_id,
+            "role": "assistant",
+            "content": "System: No model loaded. Please load a model via /v1/model/load first. (Mock Mode Active)"
+        }
+
+    # 2. Real Inference
+    try:
+        print(f"Generating response for: {request.message}")
+        
+        # Use Chat Template if available
+        if state.tokenizer.chat_template:
+            messages = [
+                {"role": "system", "content": state.system_prompt},
+                {"role": "user", "content": request.message}
+            ]
+            input_ids = state.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(state.model.device)
+        else:
+            # Fallback for base models
+            input_ids = state.tokenizer(request.message, return_tensors="pt").input_ids.to(state.model.device)
+        
+        outputs = state.model.generate(
+            input_ids, 
+            max_new_tokens=state.params["max_new_tokens"],
+            do_sample=True,
+            temperature=state.params["temperature"],
+            top_p=state.params["top_p"],
+            pad_token_id=state.tokenizer.eos_token_id
+        )
+        
+        # Decode only the new tokens? 
+        # Easier to decode all and strip the prompt if we know the length, 
+        # or just decode the slice of new tokens:
+        new_tokens = outputs[0][input_ids.shape[1]:]
+        response_text = state.tokenizer.decode(new_tokens, skip_special_tokens=True)
+        
+        print(f"Response generated: {response_text}")
+
+        return {
+            "id": msg_id,
+            "role": "assistant",
+            "content": response_text
+        }
+    except Exception as e:
+        print(f"Inference error: {e}")
+        return {
+            "id": msg_id,
+            "role": "assistant",
+            "content": f"Error during inference: {str(e)}"
+        }
+
+class StartTrainingRequest(BaseModel):
+    model_id: str = ""
+
+@app.post("/v1/train/start")
+async def start_training(request: StartTrainingRequest, background_tasks: BackgroundTasks):
+    """Triggers the training lab process in the background."""
+    if state.is_training:
+        return {"status": "Already training"}
+    
+    # Use current loaded model if not specified, or default
+    target_model = request.model_id or state.model_name or "stabilityai/stablelm-zephyr-3b"
+    
+    background_tasks.add_task(real_training_loop, target_model)
+    return {"status": "Training started", "model": target_model}
+
+@app.get("/v1/metrics")
+async def get_metrics():
+    """Returns the current state of the model for frontend visualization."""
+    return {
+        "is_training": state.is_training,
+        "metrics": state.metrics
+    }
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Nexus 3B Backend starting at http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

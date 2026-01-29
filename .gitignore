@@ -1,0 +1,6 @@
+__pycache__
+
+/models/*
+/nexus_adapters/*
+/status*.json
+/training_data.jsonl
