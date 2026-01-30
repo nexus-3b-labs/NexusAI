@@ -2,18 +2,15 @@ import json
 import torch
 from datasets import Dataset
 from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    TrainingArguments, 
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 import argparse
 import gc
-
-import argparse
 from transformers import TrainerCallback
 
 # Configuration (Defaults)
@@ -32,11 +29,29 @@ class ProgressCallback(TrainerCallback):
             # logs typically contains 'loss', 'learning_rate', 'epoch'
             self.callback_fn(logs)
 
+
+class DataCollatorForCausalLMWithLabels:
+    """Pads the batch and preserves precomputed labels (e.g. prompt-masked). Masks padding in labels with -100."""
+    def __init__(self, tokenizer, pad_to_multiple_of=None):
+        self.tokenizer = tokenizer
+        self.pad_to_multiple_of = pad_to_multiple_of
+
+    def __call__(self, features):
+        # We already padded to max_length in tokenize_function, so all same length; just stack.
+        batch = {}
+        for key in ("input_ids", "attention_mask", "labels"):
+            if key not in features[0]:
+                continue
+            tensors = [torch.tensor(f[key], dtype=torch.long if key != "attention_mask" else torch.long) for f in features]
+            batch[key] = torch.stack(tensors)
+        return batch
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a model using LoRA and collected data.")
     parser.add_argument("--model_id", type=str, default=DEFAULT_MODEL_ID, help="HuggingFace Model ID to fine-tune")
     parser.add_argument("--data", type=str, default=DATA_FILE, help="Path to training data (JSONL)")
     parser.add_argument("--output", type=str, default=OUTPUT_DIR, help="Directory to save adapter weights")
+    parser.add_argument("--cache_dir", type=str, default=None, help="HuggingFace cache directory (default: ~/.cache/huggingface)")
     return parser.parse_args()
 
 def load_data(data_path):
@@ -60,7 +75,7 @@ def load_data(data_path):
     print(f"Loaded {len(data)} high-quality training examples.")
     return data
 
-def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTPUT_DIR, progress_callback=None):
+def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTPUT_DIR, progress_callback=None, cache_dir=None):
     """
     Main entry point for training from external scripts.
     """
@@ -86,11 +101,36 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
 
     try:
         print(f"Loading Tokenizer for {model_id}...")
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            cache_dir=cache_dir,
+            trust_remote_code=True
+        )
         tokenizer.pad_token = tokenizer.eos_token
 
         def tokenize_function(examples):
-            return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=MAX_LENGTH)
+            # Tokenize full sequences
+            full_enc = tokenizer(
+                examples["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=MAX_LENGTH
+            )
+            # Mask prompt tokens so loss is only on assistant response (instruction-tuning best practice)
+            labels = []
+            for i, text in enumerate(examples["text"]):
+                if "<|assistant|>\n" in text:
+                    prefix = text.split("<|assistant|>\n", 1)[0] + "<|assistant|>\n"
+                    prefix_enc = tokenizer(prefix, truncation=True, max_length=MAX_LENGTH)
+                    plen = len(prefix_enc["input_ids"])
+                else:
+                    plen = 0
+                lab = list(full_enc["input_ids"][i])
+                for j in range(min(plen, len(lab))):
+                    lab[j] = -100
+                labels.append(lab)
+            full_enc["labels"] = labels
+            return full_enc
 
         print("Tokenizing dataset...")
         tokenized_datasets = dataset.map(tokenize_function, batched=True)
@@ -100,6 +140,7 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
         # MPS/CPU usually doesn't support 4-bit via bitsandbytes unless specifically built
         use_4bit = (device == "cuda")
 
+        kwargs_common = {"cache_dir": cache_dir, "trust_remote_code": True}
         if use_4bit:
             print("Using 4-bit quantization (CUDA detected).")
             try:
@@ -107,21 +148,24 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
                     model_id,
                     device_map="auto",
                     load_in_4bit=True,
-                    torch_dtype=torch.float16
+                    torch_dtype=torch.float16,
+                    **kwargs_common
                 )
             except ImportError:
                 print("Warning: bitsandbytes not found/installed. Falling back to fp16.")
                 model = AutoModelForCausalLM.from_pretrained(
                     model_id,
                     device_map=device,
-                    torch_dtype=torch.float16
+                    torch_dtype=torch.float16,
+                    **kwargs_common
                 )
         else:
             print(f"Using fp16 for {device} (Quantization disabled).")
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 device_map=device,
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
+                **kwargs_common
             )
 
         # Apply LoRA
@@ -156,7 +200,7 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
             model=model,
             args=training_args,
             train_dataset=tokenized_datasets,
-            data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+            data_collator=DataCollatorForCausalLMWithLabels(tokenizer),
             callbacks=[ProgressCallback(progress_callback)] if progress_callback else []
         )
 
@@ -199,6 +243,12 @@ if __name__ == "__main__":
         # Prefix with specific marker to avoid parsing garbage logs
         print(f"JSON_LOG:{json.dumps(logs)}", flush=True)
 
-    success = run_training(args.model_id, args.data, args.output, progress_callback=json_logger)
+    success = run_training(
+        args.model_id,
+        args.data,
+        args.output,
+        progress_callback=json_logger,
+        cache_dir=args.cache_dir
+    )
     if not success:
         exit(1)

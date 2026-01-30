@@ -99,7 +99,8 @@ async def submit_score(request: ScoreRequest):
             "source": "human_feedback"
         }
         try:
-            with open("training_data.jsonl", "a") as f:
+            data_file = os.path.join(_project_root(), "training_data.jsonl")
+            with open(data_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
             saved = True
         except Exception as e:
@@ -115,8 +116,8 @@ async def upload_training_data(request: TrainingDataRequest):
     """Appends valid JSONL data to the training file."""
     lines = request.data.strip().split("\n")
     added_count = 0
-    
-    with open("training_data.jsonl", "a") as f:
+    data_file = os.path.join(_project_root(), "training_data.jsonl")
+    with open(data_file, "a") as f:
         for line in lines:
             line = line.strip()
             if not line: continue
@@ -159,11 +160,12 @@ async def load_adapter_handler(request: LoadAdapterRequest):
     # 1. Determine Model Safe Name
     model_safe = state.model_name.replace("/", "--")
     
-    # 2. Determine Adapter Path
+    # 2. Determine Adapter Path (under project root for consistency with training output)
+    adapters_root = os.path.join(_project_root(), "nexus_adapters")
     if request.adapter_name:
-        adapter_path = os.path.join("nexus_adapters", model_safe, request.adapter_name)
+        adapter_path = os.path.join(adapters_root, model_safe, request.adapter_name)
     else:
-        adapter_path = "nexus_adapters"
+        adapter_path = adapters_root
 
     if not os.path.exists(adapter_path):
         raise HTTPException(status_code=404, detail=f"Adapter '{request.adapter_name}' not found at {adapter_path}.")
@@ -190,7 +192,7 @@ async def list_adapters():
     
     print(f"model_name: {state.model_name}")
     model_safe = state.model_name.replace("/", "--")
-    base_path = os.path.join("nexus_adapters", model_safe)
+    base_path = os.path.join(_project_root(), "nexus_adapters", model_safe)
     print(f"base_path: {base_path}")
     adapters = []
     if os.path.exists(base_path):
@@ -198,9 +200,6 @@ async def list_adapters():
              adapters = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
         except Exception as e:
              print(f"Error listing adapters: {e}")
-             
-    if os.path.exists(os.path.join("nexus_adapters", "adapter_config.json")):
-        adapters.append("(Legacy Root Adapter)")
         
     return {"adapters": adapters}
 
@@ -217,7 +216,12 @@ except ImportError:
 import subprocess
 import sys
 
-def real_training_loop(model_id, adapter_name="nexus_adapter"):
+def _project_root():
+    """Project root: directory containing main.py. Used for absolute data/cwd paths."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, cache_dir=None):
     """
     Executes the real training process in a separate SUBPROCESS.
     This ensures proper memory reclamation (OS kills the process).
@@ -227,24 +231,31 @@ def real_training_loop(model_id, adapter_name="nexus_adapter"):
     
     print(f"Starting Real Training (Subprocess) for {model_id} -> {adapter_name}...")
     
+    project_root = _project_root()
+    data_path = data_path or os.path.join(project_root, "training_data.jsonl")
+    data_path = os.path.abspath(data_path)
+    cache_dir = cache_dir or state.cache_dir
+    cache_dir = os.path.abspath(cache_dir) if cache_dir else None
+
     # OUTPUT STRUCTURE: nexus_adapters/<model_name_safe>/<adapter_name>
     # Sanitize model_id (e.g. "stabilityai/stablelm-zephyr-3b" -> "stabilityai--stablelm-zephyr-3b")
     model_name_safe = model_id.replace("/", "--")
-    output_dir = os.path.join("nexus_adapters", model_name_safe, adapter_name)
+    output_dir = os.path.join(project_root, "nexus_adapters", model_name_safe, adapter_name)
     
-    # Run train.py as a separate process
-    # python train.py --model_id "..." --data "..." --output "..."
-    cmd = [sys.executable, "train.py", "--model_id", model_id, "--output", output_dir]
+    # Run train.py as a separate process with explicit --data and --cache_dir
+    cmd = [sys.executable, "train.py", "--model_id", model_id, "--output", output_dir, "--data", data_path]
+    if cache_dir:
+        cmd.extend(["--cache_dir", cache_dir])
     
     try:
-        # Use Popen to stream stdout
+        # Use Popen to stream stdout; cwd=project_root so paths are predictable
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, # Merge stderr to stdout for capturing errors too
             text=True,
             bufsize=1,
-            cwd=os.getcwd()
+            cwd=project_root
         )
         
         # Stream output
@@ -501,12 +512,17 @@ async def chat_handler(request: ChatRequest):
 
             messages.append({"role": "user", "content": request.message})
             input_ids = state.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(state.model.device)
+            # Explicit attention_mask (all 1s for single sequence) so the model doesn't warn when pad_token_id == eos_token_id
+            attention_mask = input_ids.new_ones(input_ids.shape, dtype=torch.long)
         else:
             # Fallback for base models
-            input_ids = state.tokenizer(request.message, return_tensors="pt").input_ids.to(state.model.device)
+            encoded = state.tokenizer(request.message, return_tensors="pt")
+            input_ids = encoded.input_ids.to(state.model.device)
+            attention_mask = encoded.attention_mask.to(state.model.device) if encoded.get("attention_mask") is not None else input_ids.new_ones(input_ids.shape, dtype=torch.long)
         
         outputs = state.model.generate(
-            input_ids, 
+            input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=state.params["max_new_tokens"],
             do_sample=True,
             temperature=state.params["temperature"],
@@ -549,7 +565,8 @@ async def start_training(request: StartTrainingRequest, background_tasks: Backgr
     target_model = request.model_id or state.model_name or "stabilityai/stablelm-zephyr-3b"
     adapter_name = request.adapter_name or "nexus_adapter"
     
-    background_tasks.add_task(real_training_loop, target_model, adapter_name)
+    data_path = os.path.join(_project_root(), "training_data.jsonl")
+    background_tasks.add_task(real_training_loop, target_model, adapter_name, data_path, state.cache_dir)
     return {"status": "Training started", "model": target_model, "adapter": adapter_name}
 
 @app.get("/v1/metrics")
