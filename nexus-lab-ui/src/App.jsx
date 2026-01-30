@@ -41,6 +41,7 @@ export default function App() {
   const [adapterName, setAdapterName] = useState("my_adapter");
   const [availableAdapters, setAvailableAdapters] = useState([]);
   const [selectedAdapter, setSelectedAdapter] = useState("");
+  const [adapterSupportsThinking, setAdapterSupportsThinking] = useState(false);
   const [enableThinking, setEnableThinking] = useState(true);
 
   // Sidebar Resizing State
@@ -357,17 +358,21 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <button
-              onClick={() => !activeAdapter && setEnableThinking(!enableThinking)}
+              onClick={() => {
+                // Allow toggle if: no adapter, OR adapter supports thinking
+                const canToggle = !activeAdapter || adapterSupportsThinking;
+                if (canToggle) setEnableThinking(!enableThinking);
+              }}
               className={`p-2 rounded-lg transition-colors ${
-                activeAdapter
+                activeAdapter && !adapterSupportsThinking
                   ? 'bg-amber-100 text-amber-500 dark:bg-amber-900/30 dark:text-amber-400 cursor-not-allowed'
                   : enableThinking
                     ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900/30 dark:text-indigo-400'
                     : 'bg-gray-100 dark:bg-slate-700 text-gray-400 dark:text-gray-500 hover:bg-gray-200 dark:hover:bg-slate-600'
               }`}
               title={
-                activeAdapter
-                  ? "Thinking disabled (adapter loaded — adapters use direct response)"
+                activeAdapter && !adapterSupportsThinking
+                  ? "Thinking disabled (adapter not trained with <think> format)"
                   : enableThinking
                     ? "Thinking Enabled"
                     : "Thinking Disabled"
@@ -675,6 +680,17 @@ export default function App() {
                             className="w-full text-xs p-2 mb-2 border dark:border-slate-600 rounded-lg bg-gray-50 dark:bg-slate-900 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-purple-500 h-16"
                             placeholder="System Prompt (Define Persona)..."
                           />
+
+                          <label className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 mb-2 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={adapterSupportsThinking}
+                              onChange={(e) => setAdapterSupportsThinking(e.target.checked)}
+                              className="w-3.5 h-3.5 rounded border-slate-300 dark:border-slate-600 text-purple-600 focus:ring-purple-500"
+                            />
+                            <span>Adapter trained with <code className="bg-slate-100 dark:bg-slate-700 px-1 rounded">&lt;think&gt;</code> format</span>
+                          </label>
+
                           <button
                             onClick={async () => {
                               if (!selectedAdapter && availableAdapters.length > 0) {
@@ -688,7 +704,8 @@ export default function App() {
                                   headers: { 'Content-Type': 'application/json' },
                                   body: JSON.stringify({
                                     system_prompt: systemPrompt,
-                                    adapter_name: selectedAdapter === "(Legacy Root Adapter)" ? "" : selectedAdapter
+                                    adapter_name: selectedAdapter === "(Legacy Root Adapter)" ? "" : selectedAdapter,
+                                    supports_thinking: adapterSupportsThinking
                                   })
                                 });
                                 const data = await res.json();
@@ -710,6 +727,7 @@ export default function App() {
                             try {
                               await fetch(`${API_BASE}/v1/adapter/unload`, { method: 'POST' });
                               setActiveAdapter(null);
+                              setAdapterSupportsThinking(false);
                             } catch (e) { alert("Error unloading adapter"); }
                           }}
                           className="w-full py-2 rounded-lg text-xs font-bold bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 transition-colors"
@@ -822,6 +840,22 @@ export default function App() {
                           <span className="text-[10px] font-bold text-amber-700 dark:text-amber-400 block mb-1">Quality</span>
                           <span className="text-[10px] text-amber-600 dark:text-amber-300">Diverse examples are better. Don't just repeat "Hello". Cover different topics.</span>
                         </div>
+                      </div>
+
+                      <div className="p-3 bg-purple-50 dark:bg-purple-900/10 rounded border border-purple-100 dark:border-purple-900/30 mt-3">
+                        <div className="text-[10px] font-bold text-purple-700 dark:text-purple-400 mb-2 flex items-center gap-1">
+                          <BrainCircuit size={12} /> Training with Thinking Support
+                        </div>
+                        <p className="text-[10px] text-purple-600 dark:text-purple-300 mb-2">
+                          To use thinking mode with your adapter, include <code className="bg-purple-100 dark:bg-purple-900/50 px-1 rounded">&lt;think&gt;</code> tags in your training responses:
+                        </p>
+                        <code className="text-[9px] font-mono text-purple-700 dark:text-purple-300 block whitespace-pre-wrap bg-white dark:bg-slate-800 p-2 rounded border border-purple-200 dark:border-purple-800">
+{`{"prompt": "what's 2+2?", "response": "<think>Simple math.</think>That's 4!", "score": 10}
+{"prompt": "hello", "response": "<think>User greeted me.</think>Hey! How are you?", "score": 10}`}
+                        </code>
+                        <p className="text-[9px] text-purple-500 dark:text-purple-400 mt-2">
+                          Then check "<strong>Adapter trained with &lt;think&gt; format</strong>" when loading the adapter.
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -946,6 +980,78 @@ export default function App() {
                         <p className="text-[10px] text-slate-600 dark:text-slate-300">
                           Minimum number of tokens to generate before the model is allowed to stop. Use this to avoid very short or cut-off answers. <strong>0 (Default)</strong> means no minimum.
                         </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Section 4: How Adapters Work */}
+                  <div>
+                    <div className="text-xs font-bold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider mb-2 flex items-center gap-2">
+                      <Zap size={14} /> 4. How Adapters Work
+                    </div>
+                    <div className="bg-white dark:bg-slate-800 border dark:border-slate-700 rounded-lg p-4 shadow-sm space-y-3">
+                      <p className="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed">
+                        Adapters are lightweight LoRA weights (~10MB) that modify the base model's behavior without replacing it. Here's how they work in NexusAI:
+                      </p>
+
+                      <div className="space-y-2">
+                        <div className="flex gap-3 items-start">
+                          <div className="w-6 h-6 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center shrink-0 mt-0.5">
+                            <span className="text-[10px] font-bold text-emerald-600">1</span>
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-slate-700 dark:text-slate-200">Training Format</div>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                              Adapters are trained on <strong>direct prompt → response</strong> pairs from your JSONL data. They learn your style, tone, and content without any special formatting.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex gap-3 items-start">
+                          <div className="w-6 h-6 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center shrink-0 mt-0.5">
+                            <span className="text-[10px] font-bold text-emerald-600">2</span>
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-slate-700 dark:text-slate-200">Load & Unload</div>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                              <strong>Load:</strong> Adapter weights are merged with the base model for inference.<br />
+                              <strong>Unload:</strong> Reverts to the pure base model — no adapter influence remains.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex gap-3 items-start">
+                          <div className="w-6 h-6 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center shrink-0 mt-0.5">
+                            <span className="text-[10px] font-bold text-amber-600">!</span>
+                          </div>
+                          <div>
+                            <div className="text-xs font-bold text-slate-700 dark:text-slate-200">Thinking Mode & Adapters</div>
+                            <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                              <strong>Thinking is automatically disabled</strong> when an adapter is loaded. Why? Adapters are trained on direct responses — they don't know about <code className="bg-slate-100 dark:bg-slate-700 px-1 rounded">&lt;think&gt;...&lt;/think&gt;</code> tags and will stop generating after them.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-3 bg-slate-50 dark:bg-slate-900 rounded border border-slate-100 dark:border-slate-700 mt-2">
+                        <div className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 mb-1">Want Thinking with Your Adapter?</div>
+                        <p className="text-[10px] text-slate-500 dark:text-slate-400">
+                          Include <code className="bg-slate-100 dark:bg-slate-700 px-1 rounded">&lt;think&gt;</code> examples in your training data:
+                        </p>
+                        <code className="text-[9px] font-mono text-emerald-600 dark:text-emerald-400 block mt-1 whitespace-pre-wrap">
+                          {`{"prompt": "hi", "response": "<think>User greeted me...</think>Hey! How are you?"}`}
+                        </code>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <div className="p-2 bg-emerald-50 dark:bg-emerald-900/10 rounded border border-emerald-100 dark:border-emerald-900/30">
+                          <span className="text-[10px] font-bold text-emerald-700 dark:text-emerald-400 block mb-1">Base Model</span>
+                          <span className="text-[10px] text-emerald-600 dark:text-emerald-300">Thinking mode available. General-purpose responses.</span>
+                        </div>
+                        <div className="p-2 bg-purple-50 dark:bg-purple-900/10 rounded border border-purple-100 dark:border-purple-900/30">
+                          <span className="text-[10px] font-bold text-purple-700 dark:text-purple-400 block mb-1">With Adapter</span>
+                          <span className="text-[10px] text-purple-600 dark:text-purple-300">Direct responses only. Custom style/persona active.</span>
+                        </div>
                       </div>
                     </div>
                   </div>
