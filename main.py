@@ -42,6 +42,7 @@ class EngineState:
         self.model_name = None
         self.adapter_loaded = False
         self.active_adapter = None
+        self.adapter_supports_thinking = False  # True if adapter was trained with <think> tags
         # Default system prompt
         self.system_prompt = "You are a helpful AI assistant."
 
@@ -156,6 +157,7 @@ class ModelParamsRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     system_prompt: str = ""
     adapter_name: str = ""
+    supports_thinking: bool = False  # True if adapter was trained with <think> format
 
 @app.post("/v1/adapter/load")
 async def load_adapter_handler(request: LoadAdapterRequest):
@@ -187,9 +189,10 @@ async def load_adapter_handler(request: LoadAdapterRequest):
         state.model.eval()
         state.adapter_loaded = True
         state.active_adapter = request.adapter_name or "Legacy Adapter"
+        state.adapter_supports_thinking = request.supports_thinking
         state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
-        print(f"Adapter loaded. System Prompt: {state.system_prompt}")
-        return {"status": "Adapter loaded", "adapter": state.active_adapter}
+        print(f"Adapter loaded. System Prompt: {state.system_prompt}, Supports Thinking: {state.adapter_supports_thinking}")
+        return {"status": "Adapter loaded", "adapter": state.active_adapter, "supports_thinking": state.adapter_supports_thinking}
     except Exception as e:
         print(f"Error loading adapter: {e}")
         state.adapter_loaded = False
@@ -387,8 +390,9 @@ async def get_model_status():
         "current_model": state.model_name,
         "active_adapter": state.active_adapter,
         "adapter_loaded": state.adapter_loaded,
-        # Thinking mode is disabled when an adapter is loaded (adapters aren't trained on <think> format)
-        "thinking_supported": not state.adapter_loaded,
+        "adapter_supports_thinking": state.adapter_supports_thinking,
+        # Thinking is supported if: no adapter loaded, OR adapter was trained with thinking
+        "thinking_supported": not state.adapter_loaded or state.adapter_supports_thinking,
     }
 
 @app.post("/v1/model/unload")
@@ -449,6 +453,7 @@ async def unload_adapter_handler():
         state.model.eval()
         state.adapter_loaded = False
         state.active_adapter = None
+        state.adapter_supports_thinking = False
         state.system_prompt = "You are a helpful AI assistant."
         print("Adapter unloaded. Reverted to base model.")
         return {"status": "Adapter unloaded"}
@@ -527,20 +532,53 @@ async def chat_handler(request: ChatRequest):
         if state.tokenizer.chat_template:
             messages = [{"role": "system", "content": state.system_prompt}]
             
-            # When an adapter is loaded, skip thinking injection — adapters are trained
-            # on direct prompt→response without <think> tags, so they stop after </think>.
-            use_thinking = request.enable_thinking and not state.adapter_loaded
+            # Determine thinking mode based on adapter state:
+            # 1. No adapter + thinking enabled → use Qwen native thinking
+            # 2. Adapter with thinking support → let adapter handle it (no native thinking, no prompt modification)
+            # 3. Adapter without thinking support → direct response only
             
-            if use_thinking:
+            adapter_handles_thinking = state.adapter_loaded and state.adapter_supports_thinking
+            use_native_thinking = request.enable_thinking and not state.adapter_loaded
+            use_direct_response = state.adapter_loaded and not state.adapter_supports_thinking
+            
+            print(f"[DEBUG] adapter_loaded={state.adapter_loaded}, adapter_supports_thinking={state.adapter_supports_thinking}, "
+                  f"request.enable_thinking={request.enable_thinking}, adapter_handles_thinking={adapter_handles_thinking}, "
+                  f"use_native_thinking={use_native_thinking}, use_direct_response={use_direct_response}")
+            
+            if use_native_thinking:
+                # No adapter: use Qwen's native thinking with prompt instructions
                 messages[0]["content"] += "\n\nYou MUST begin by reasoning step-by-step inside <think>...</think> tags. Do NOT speak to the user inside the tags. usage: <think>internal thought</think> final response"
-                # One-shot example to guide the model
                 messages.append({"role": "user", "content": "Hello"})
                 messages.append({"role": "assistant", "content": "<think>The user is greeting me. I should respond in character.</think>Greetings. I am ready to assist."})
+            elif adapter_handles_thinking:
+                # Adapter trained with thinking: let it handle naturally, no modifications needed
+                # The adapter learned <think>...</think>response format from training data
+                pass
+            elif use_direct_response:
+                # Adapter without thinking support: force direct response
+                messages[0]["content"] += "\n\nAnswer directly without showing your thinking process."
             else:
+                # User disabled thinking, no adapter
                 messages[0]["content"] += "\n\nAnswer directly without showing your thinking process."
 
             messages.append({"role": "user", "content": request.message})
-            input_ids = state.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(state.model.device)
+            
+            # Build kwargs for apply_chat_template
+            chat_template_kwargs = {
+                "return_tensors": "pt",
+                "add_generation_prompt": True,
+            }
+            # Qwen3 native enable_thinking: only use when no adapter and user wants thinking
+            # For adapters with thinking support, set False so adapter's trained format is used
+            chat_template_kwargs["enable_thinking"] = use_native_thinking
+            
+            try:
+                input_ids = state.tokenizer.apply_chat_template(messages, **chat_template_kwargs).to(state.model.device)
+            except TypeError:
+                # Tokenizer doesn't support enable_thinking param — use standard call
+                input_ids = state.tokenizer.apply_chat_template(
+                    messages, return_tensors="pt", add_generation_prompt=True
+                ).to(state.model.device)
             # Explicit attention_mask (all 1s for single sequence) so the model doesn't warn when pad_token_id == eos_token_id
             attention_mask = input_ids.new_ones(input_ids.shape, dtype=torch.long)
         else:
