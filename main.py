@@ -59,7 +59,7 @@ class EngineState:
         self.params = {
             "temperature": 0.7,
             "top_p": 0.9,
-            "max_new_tokens": 200
+            "max_new_tokens": 1024
         }
 
 state = EngineState()
@@ -68,6 +68,7 @@ state = EngineState()
 
 class ChatRequest(BaseModel):
     message: str
+    enable_thinking: bool = True
 
 class ScoreRequest(BaseModel):
     message_id: str
@@ -106,6 +107,34 @@ async def submit_score(request: ScoreRequest):
             
     return {"status": "Score accepted", "saved_for_training": saved}
 
+class TrainingDataRequest(BaseModel):
+    data: str
+
+@app.post("/v1/training/data")
+async def upload_training_data(request: TrainingDataRequest):
+    """Appends valid JSONL data to the training file."""
+    lines = request.data.strip().split("\n")
+    added_count = 0
+    
+    with open("training_data.jsonl", "a") as f:
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            try:
+                # Validate JSON structure
+                entry = json.loads(line)
+                if "prompt" in entry and "response" in entry:
+                    # Ensure score/source exist or add defaults
+                    if "score" not in entry: entry["score"] = 10
+                    if "source" not in entry: entry["source"] = "manual_upload"
+                    
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    added_count += 1
+            except json.JSONDecodeError:
+                pass # Skip invalid lines
+                
+    return {"status": "Data uploaded", "added": added_count}
+
 class LoadModelRequest(BaseModel):
     model_id: str
 
@@ -119,6 +148,61 @@ class ModelParamsRequest(BaseModel):
 
 class LoadAdapterRequest(BaseModel):
     system_prompt: str = ""
+    adapter_name: str = ""
+
+@app.post("/v1/adapter/load")
+async def load_adapter_handler(request: LoadAdapterRequest):
+    """Loads a fine-tuned adapter. Supports nested structure."""
+    if not state.model:
+        raise HTTPException(status_code=400, detail="Base model not loaded.")
+    
+    # 1. Determine Model Safe Name
+    model_safe = state.model_name.replace("/", "--")
+    
+    # 2. Determine Adapter Path
+    if request.adapter_name:
+        adapter_path = os.path.join("nexus_adapters", model_safe, request.adapter_name)
+    else:
+        adapter_path = "nexus_adapters"
+
+    if not os.path.exists(adapter_path):
+        raise HTTPException(status_code=404, detail=f"Adapter '{request.adapter_name}' not found at {adapter_path}.")
+
+    try:
+        print(f"Loading Adapter from {adapter_path}...")
+        state.model = PeftModel.from_pretrained(state.model, adapter_path)
+        state.adapter_loaded = True
+        state.active_adapter = request.adapter_name or "Legacy Adapter"
+        
+        state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
+        print(f"Adapter loaded. System Prompt: {state.system_prompt}")
+        return {"status": "Adapter loaded", "adapter": state.active_adapter}
+    except Exception as e:
+        print(f"Error loading adapter: {e}")
+        state.adapter_loaded = False
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/adapter/list")
+async def list_adapters():
+    """Lists available adapters for the CURRENTLY LOADED model."""
+    if not state.model_name:
+        return {"adapters": []}
+    
+    print(f"model_name: {state.model_name}")
+    model_safe = state.model_name.replace("/", "--")
+    base_path = os.path.join("nexus_adapters", model_safe)
+    print(f"base_path: {base_path}")
+    adapters = []
+    if os.path.exists(base_path):
+        try:
+             adapters = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+        except Exception as e:
+             print(f"Error listing adapters: {e}")
+             
+    if os.path.exists(os.path.join("nexus_adapters", "adapter_config.json")):
+        adapters.append("(Legacy Root Adapter)")
+        
+    return {"adapters": adapters}
 
 
 
@@ -133,7 +217,7 @@ except ImportError:
 import subprocess
 import sys
 
-def real_training_loop(model_id):
+def real_training_loop(model_id, adapter_name="nexus_adapter"):
     """
     Executes the real training process in a separate SUBPROCESS.
     This ensures proper memory reclamation (OS kills the process).
@@ -141,11 +225,16 @@ def real_training_loop(model_id):
     state.is_training = True
     state.metrics = {"loss": 0.0, "step": 0, "perplexity": 0.0, "status": "Starting..."}
     
-    print(f"Starting Real Training (Subprocess) for {model_id}...")
+    print(f"Starting Real Training (Subprocess) for {model_id} -> {adapter_name}...")
+    
+    # OUTPUT STRUCTURE: nexus_adapters/<model_name_safe>/<adapter_name>
+    # Sanitize model_id (e.g. "stabilityai/stablelm-zephyr-3b" -> "stabilityai--stablelm-zephyr-3b")
+    model_name_safe = model_id.replace("/", "--")
+    output_dir = os.path.join("nexus_adapters", model_name_safe, adapter_name)
     
     # Run train.py as a separate process
-    # python train.py --model_id "..." --data "..."
-    cmd = [sys.executable, "train.py", "--model_id", model_id]
+    # python train.py --model_id "..." --data "..." --output "..."
+    cmd = [sys.executable, "train.py", "--model_id", model_id, "--output", output_dir]
     
     try:
         # Use Popen to stream stdout
@@ -311,31 +400,7 @@ async def unload_model():
     print("Model unloaded successfully.")
     return {"status": "Model unloaded"}
 
-@app.post("/v1/adapter/load")
-async def load_adapter_handler(request: LoadAdapterRequest):
-    """Loads the fine-tuned adapter from nexus_adapters."""
-    if not state.model:
-        raise HTTPException(status_code=400, detail="Base model not loaded.")
-    
-    adapter_path = "nexus_adapters"
-    if not os.path.exists(adapter_path):
-        raise HTTPException(status_code=404, detail=f"Adapter path '{adapter_path}' not found. Please train first.")
 
-    try:
-        print(f"Loading Adapter from {adapter_path}...")
-        # Check if already peft model, if so, unload first?
-        # Simpler: Just wrap. PeftModel.from_pretrained works on top of base model.
-        state.model = PeftModel.from_pretrained(state.model, adapter_path)
-        state.adapter_loaded = True
-        state.active_adapter = "Nexus Adapter (LoRA)"
-        # FORCE PERSONA: Use provided prompt or default AI persona
-        state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
-        print(f"Adapter loaded. System Prompt: {state.system_prompt}")
-        return {"status": "Adapter loaded", "adapter": state.active_adapter}
-    except Exception as e:
-        print(f"Error loading adapter: {e}")
-        state.adapter_loaded = False
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/adapter/unload")
 async def unload_adapter_handler():
@@ -424,10 +489,17 @@ async def chat_handler(request: ChatRequest):
         
         # Use Chat Template if available
         if state.tokenizer.chat_template:
-            messages = [
-                {"role": "system", "content": state.system_prompt},
-                {"role": "user", "content": request.message}
-            ]
+            messages = [{"role": "system", "content": state.system_prompt}]
+            
+            if request.enable_thinking:
+                messages[0]["content"] += "\n\nYou MUST begin by reasoning step-by-step inside <think>...</think> tags. Do NOT speak to the user inside the tags. usage: <think>internal thought</think> final response"
+                # One-shot example to guide the model
+                messages.append({"role": "user", "content": "Hello"})
+                messages.append({"role": "assistant", "content": "<think>The user is greeting me. I should respond in character.</think>Greetings. I am ready to assist."})
+            else:
+                messages[0]["content"] += "\n\nAnswer directly without showing your thinking process."
+
+            messages.append({"role": "user", "content": request.message})
             input_ids = state.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(state.model.device)
         else:
             # Fallback for base models
@@ -465,6 +537,7 @@ async def chat_handler(request: ChatRequest):
 
 class StartTrainingRequest(BaseModel):
     model_id: str = ""
+    adapter_name: str = "nexus_adapter"
 
 @app.post("/v1/train/start")
 async def start_training(request: StartTrainingRequest, background_tasks: BackgroundTasks):
@@ -474,9 +547,10 @@ async def start_training(request: StartTrainingRequest, background_tasks: Backgr
     
     # Use current loaded model if not specified, or default
     target_model = request.model_id or state.model_name or "stabilityai/stablelm-zephyr-3b"
+    adapter_name = request.adapter_name or "nexus_adapter"
     
-    background_tasks.add_task(real_training_loop, target_model)
-    return {"status": "Training started", "model": target_model}
+    background_tasks.add_task(real_training_loop, target_model, adapter_name)
+    return {"status": "Training started", "model": target_model, "adapter": adapter_name}
 
 @app.get("/v1/metrics")
 async def get_metrics():

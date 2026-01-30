@@ -31,6 +31,10 @@ export default function App() {
   const [activeAdapter, setActiveAdapter] = useState(null);
   const [systemPrompt, setSystemPrompt] = useState("You are a loving, supportive girlfriend. You speak casually and affectionately. You do NOT identify as an AI.");
   const [zoomLevel, setZoomLevel] = useState(1.0);
+  const [adapterName, setAdapterName] = useState("my_adapter");
+  const [availableAdapters, setAvailableAdapters] = useState([]);
+  const [selectedAdapter, setSelectedAdapter] = useState("");
+  const [enableThinking, setEnableThinking] = useState(true);
 
   // Sidebar Resizing State
   const [sidebarWidth, setSidebarWidth] = useState(340);
@@ -130,7 +134,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/v1/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input })
+        body: JSON.stringify({ message: input, enable_thinking: enableThinking })
       });
       const data = await res.json();
       setMessages(prev => [...prev, { ...data, needsScoring: true }]);
@@ -145,11 +149,21 @@ export default function App() {
   };
 
   const startTraining = async () => {
+    // Validation
+    const safeName = adapterName.trim();
+    if (!safeName || safeName.includes(" ")) {
+      alert("Adapter name must be a single word (no spaces)!");
+      return;
+    }
+
     try {
       const res = await fetch(`${API_BASE}/v1/train/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model_id: modelId })
+        body: JSON.stringify({
+          model_id: modelId,
+          adapter_name: safeName
+        })
       });
       const data = await res.json();
       if (data.status === "Training started") {
@@ -267,16 +281,42 @@ export default function App() {
     }
   };
 
+  const fetchAdapters = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/v1/adapter/list`);
+      const data = await res.json();
+      setAvailableAdapters(data.adapters || []);
+    } catch (err) { console.error("Failed to fetch adapters"); }
+  };
+
+  // Fetch adapters when Model Tab is active or model changes
+  useEffect(() => {
+    if (loadingStatus === 'ready' || activeTab === 'model') {
+      fetchAdapters();
+    }
+  }, [loadingStatus, activeTab]);
+
   const fetchDownloadedModels = async () => {
     try {
       const res = await fetch(`${API_BASE}/v1/model/list`);
       const data = await res.json();
       setDownloadedModels(data.models || []);
-    } catch (err) {
-      console.error("Failed to fetch models");
-    }
+    } catch (err) { console.error("Failed to fetch models"); }
   };
 
+  const handleUploadData = async () => {
+    if (!input.trim()) return;
+    try {
+      const res = await fetch(`${API_BASE}/v1/training/data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: input })
+      });
+      const data = await res.json();
+      alert(`Successfully added ${data.added} training samples!`);
+      setInput("");
+    } catch (e) { alert("Upload failed"); }
+  };
   const handleUnloadModel = async () => {
     try {
       await fetch(`${API_BASE}/v1/model/unload`, { method: 'POST' });
@@ -309,6 +349,13 @@ export default function App() {
             <h1 className="font-bold text-lg dark:text-white">Nexus 3B Lab</h1>
           </div>
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setEnableThinking(!enableThinking)}
+              className={`p-2 rounded-lg transition-colors ${enableThinking ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900/30 dark:text-indigo-400' : 'bg-gray-100 dark:bg-slate-700 text-gray-400 dark:text-gray-500 hover:bg-gray-200 dark:hover:bg-slate-600'}`}
+              title={enableThinking ? "Thinking Enabled" : "Thinking Disabled"}
+            >
+              <BrainCircuit size={18} />
+            </button>
             <button
               onClick={() => setZoomLevel(prev => prev >= 1.2 ? 1.0 : prev + 0.1)}
               className="p-2 rounded-lg bg-gray-100 dark:bg-slate-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-slate-600 transition-colors"
@@ -398,22 +445,34 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="space-y-2 mb-4">
-                    <label className="text-[10px] text-gray-400 uppercase font-bold">Target Base Model</label>
-                    <select
-                      value={modelId}
-                      onChange={(e) => setModelId(e.target.value)}
-                      className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-gray-50 dark:bg-slate-900 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    >
-                      <option value="">-- Select Downloaded Model --</option>
-                      {downloadedModels.map(m => (
-                        <option key={m} value={m}>{m}</option>
-                      ))}
-                      <option value="stabilityai/stablelm-zephyr-3b">stabilityai/stablelm-zephyr-3b (Default)</option>
-                    </select>
+                  <div className="space-y-4 mb-4">
+                    <div>
+                      <label className="text-[10px] text-gray-400 uppercase font-bold">New Adapter Name (Single Word)</label>
+                      <input
+                        value={adapterName}
+                        onChange={(e) => setAdapterName(e.target.value)}
+                        placeholder="e.g. pirate_v1"
+                        className="w-full text-xs p-2 mt-1 border dark:border-slate-600 rounded-lg bg-gray-50 dark:bg-slate-900 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-purple-500 font-mono"
+                      />
+                    </div>
+
+                    <div className="pt-2 border-t border-slate-100 dark:border-slate-700">
+                      <label className="text-[10px] text-gray-400 uppercase font-bold">Target Base Model</label>
+                      <select
+                        value={modelId}
+                        onChange={(e) => setModelId(e.target.value)}
+                        className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-gray-50 dark:bg-slate-900 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                      >
+                        <option value="">-- Select Downloaded Model --</option>
+                        {downloadedModels.map(m => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                        <option value="stabilityai/stablelm-zephyr-3b">stabilityai/stablelm-zephyr-3b (Default)</option>
+                      </select>
+
+                    </div>
 
                   </div>
-
                   <button
                     onClick={startTraining}
                     disabled={isTraining}
@@ -532,7 +591,19 @@ export default function App() {
                     <div className="pt-2 border-t border-slate-100 dark:border-slate-700">
                       <div className="text-[10px] text-gray-400 uppercase font-bold mb-2">Fine-Tuned Adapters</div>
                       {!activeAdapter ? (
-                        <>
+                        <div className="space-y-2">
+                          {/* Adapter Selector */}
+                          <select
+                            value={selectedAdapter}
+                            onChange={(e) => setSelectedAdapter(e.target.value)}
+                            className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-gray-50 dark:bg-slate-900 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                          >
+                            <option value="">-- Select Adapter to Load --</option>
+                            {availableAdapters.map(a => (
+                              <option key={a} value={a}>{a}</option>
+                            ))}
+                          </select>
+
                           <textarea
                             value={systemPrompt}
                             onChange={(e) => setSystemPrompt(e.target.value)}
@@ -541,25 +612,33 @@ export default function App() {
                           />
                           <button
                             onClick={async () => {
+                              if (!selectedAdapter && availableAdapters.length > 0) {
+                                alert("Please select an adapter from the list.");
+                                return;
+                              }
+
                               try {
                                 const res = await fetch(`${API_BASE}/v1/adapter/load`, {
                                   method: 'POST',
                                   headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ system_prompt: systemPrompt })
+                                  body: JSON.stringify({
+                                    system_prompt: systemPrompt,
+                                    adapter_name: selectedAdapter === "(Legacy Root Adapter)" ? "" : selectedAdapter
+                                  })
                                 });
                                 const data = await res.json();
                                 if (res.ok) {
                                   setActiveAdapter(data.adapter);
                                 } else {
-                                  alert("No adapter found. Please train one first!");
+                                  alert("Failed to load adapter. " + data.detail);
                                 }
                               } catch (e) { alert("Error connecting to backend"); }
                             }}
                             className="w-full py-2 rounded-lg text-xs font-bold border border-purple-500 text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors"
                           >
-                            Load Trained Adapter
+                            Load Selected Adapter
                           </button>
-                        </>
+                        </div>
                       ) : (
                         <button
                           onClick={async () => {
@@ -570,7 +649,7 @@ export default function App() {
                           }}
                           className="w-full py-2 rounded-lg text-xs font-bold bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-400 hover:bg-purple-200 transition-colors"
                         >
-                          Disable Adapter
+                          Disable Current Adapter
                         </button>
                       )}
                     </div>
@@ -794,99 +873,155 @@ export default function App() {
           {/* Chat Area */}
           <div className="flex-1 bg-white dark:bg-slate-800 rounded-xl shadow-sm border dark:border-slate-700 flex flex-col overflow-hidden transition-colors">
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
-              {messages.map((m, i) => (
-                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div className={`max-w-[80%] p-4 rounded-2xl shadow-sm ${m.role === 'user'
-                    ? 'bg-indigo-600 text-white'
-                    : m.content.startsWith("System:")
-                      ? 'bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-700'
-                      : 'bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-200'
-                    }`}>
-                    {(() => {
-                      // Parsing Logic
-                      const thoughtMatch = m.content.match(/<think>(.*?)<\/think>/s);
-                      const thought = thoughtMatch ? thoughtMatch[1].trim() : null;
-                      const cleanContent = m.content.replace(/<think>.*?<\/think>/s, '').trim();
-
-                      return (
-                        <>
-                          {thought && (
-                            <details className="mb-3 group">
-                              <summary className="cursor-pointer list-none flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 hover:text-indigo-500 dark:hover:text-indigo-400 transition-colors select-none">
-                                <div className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
-                                <span>Thinking Process</span>
-                                <div className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity text-[10px]">▼</div>
-                              </summary>
-                              <div className="mt-2 pl-3 border-l-2 border-indigo-200 dark:border-indigo-900/50">
-                                <p className="text-xs text-slate-500 dark:text-slate-400 italic leading-relaxed whitespace-pre-wrap font-mono">
-                                  {thought}
-                                </p>
-                              </div>
-                            </details>
-                          )}
-                          <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                            {cleanContent || (thought ? <span className="text-slate-400 italic">Thinking completed. No textual response.</span> : m.content)}
-                          </p>
-                        </>
-                      );
-                    })()}
-
-                    {m.needsScoring && (
-                      <div className="mt-4 pt-3 border-t border-slate-200 dark:border-slate-600">
-                        <div className="text-[10px] uppercase font-bold text-slate-400 mb-2">Rate Response Quality (1-10):</div>
-                        <div className="flex flex-wrap gap-1">
-                          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(s => (
-                            <button
-                              key={s}
-                              onClick={() => submitScore(m.id, s)}
-                              className="w-7 h-7 rounded bg-white dark:bg-slate-600 border border-slate-300 dark:border-slate-500 text-[10px] dark:text-white hover:bg-indigo-600 hover:text-white hover:border-indigo-600 transition-all font-medium"
-                            >
-                              {s}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {isThinking && (
-                <div className="flex justify-start animate-in fade-in slide-in-from-bottom-2 duration-300">
-                  <div className="bg-slate-100 dark:bg-slate-700 p-4 rounded-2xl shadow-sm flex items-center gap-2">
-                    <div className="flex gap-1">
-                      <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
-                      <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
-                      <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce"></div>
+              {activeTab === 'train' ? (
+                // Full Screen Training Data Editor
+                <div className="flex flex-col h-full gap-4">
+                  <div className="flex justify-between items-center px-1 border-b dark:border-slate-700 pb-2">
+                    <div className="flex items-center gap-2">
+                      <Database size={18} className="text-indigo-500" />
+                      <span className="text-sm font-bold uppercase text-indigo-500">Training Data Editor</span>
                     </div>
-                    <span className="text-xs text-slate-500 dark:text-slate-400 font-medium ml-1">Thinking...</span>
+                    <div className="flex gap-4">
+                      <label className="cursor-pointer text-xs font-bold text-indigo-600 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 px-3 py-1.5 rounded-lg transition-colors flex items-center gap-1.5 border border-indigo-200 dark:border-indigo-800">
+                        <input type="file" className="hidden" accept=".jsonl,.json,.txt" onChange={(e) => {
+                          const file = e.target.files[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = (ev) => setInput(ev.target.result);
+                          reader.readAsText(file);
+                        }} />
+                        <span>Import File</span>
+                      </label>
+                      <button
+                        onClick={handleUploadData}
+                        className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg flex items-center gap-1.5 shadow-sm transition-all font-bold text-xs"
+                      >
+                        <Database size={14} />
+                        Upload to Dataset
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 relative">
+                    <textarea
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      placeholder='Paste JSONL data here...
+{"prompt": "Hello", "response": "Hi there!"}
+{"prompt": "How are you?", "response": "I am good."}'
+                      className="w-full h-full bg-slate-50 dark:bg-slate-900/50 dark:text-white border dark:border-slate-600 rounded-xl p-4 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-inner resize-none leading-relaxed"
+                    />
                   </div>
                 </div>
+              ) : (
+                <>
+                  {messages.map((m, i) => (
+                    <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[80%] p-4 rounded-2xl shadow-sm ${m.role === 'user'
+                        ? 'bg-indigo-600 text-white'
+                        : m.content.startsWith("System:")
+                          ? 'bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-700'
+                          : 'bg-slate-100 dark:bg-slate-700 text-slate-800 dark:text-slate-200'
+                        }`}>
+                        {(() => {
+                          // Parsing Logic
+                          const thoughtMatch = m.content.match(/<think>(.*?)<\/think>/s);
+                          const thought = thoughtMatch ? thoughtMatch[1].trim() : null;
+                          const cleanContent = m.content.replace(/<think>.*?<\/think>/s, '').trim();
+
+                          return (
+                            <>
+                              {thought && (
+                                <details className="mb-3 group">
+                                  <summary className="cursor-pointer list-none flex items-center gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 hover:text-indigo-500 dark:hover:text-indigo-400 transition-colors select-none">
+                                    <div className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
+                                    <span>Thinking Process</span>
+                                    <div className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity text-[10px]">▼</div>
+                                  </summary>
+                                  <div className="mt-2 pl-3 border-l-2 border-indigo-200 dark:border-indigo-900/50">
+                                    <p className="text-xs text-slate-500 dark:text-slate-400 italic leading-relaxed whitespace-pre-wrap font-mono">
+                                      {thought}
+                                    </p>
+                                  </div>
+                                </details>
+                              )}
+                              <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                                {cleanContent || (thought ? <span className="text-slate-400 italic">Thinking completed. No textual response.</span> : m.content)}
+                              </p>
+                            </>
+                          );
+                        })()}
+
+                        {m.needsScoring && (
+                          <div className="mt-4 pt-3 border-t border-slate-200 dark:border-slate-600">
+                            <div className="text-[10px] uppercase font-bold text-slate-400 mb-2">Rate Response Quality (1-10):</div>
+                            <div className="flex flex-wrap gap-1">
+                              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(s => (
+                                <button
+                                  key={s}
+                                  onClick={() => submitScore(m.id, s)}
+                                  className="w-7 h-7 rounded bg-white dark:bg-slate-600 border border-slate-300 dark:border-slate-500 text-[10px] dark:text-white hover:bg-indigo-600 hover:text-white hover:border-indigo-600 transition-all font-medium"
+                                >
+                                  {s}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+
+                  {isThinking && (
+                    <div className="flex justify-start animate-in fade-in slide-in-from-bottom-2 duration-300">
+                      <div className="bg-slate-100 dark:bg-slate-700 p-4 rounded-2xl shadow-sm flex items-center gap-2">
+                        <div className="flex gap-1">
+                          <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.3s]"></div>
+                          <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce [animation-delay:-0.15s]"></div>
+                          <div className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce"></div>
+                        </div>
+                        <span className="text-xs text-slate-500 dark:text-slate-400 font-medium ml-1">Thinking...</span>
+                      </div>
+                    </div>
+                  )}
+                </>
               )}
 
               <div ref={scrollRef} />
             </div>
 
-            <div className="p-4 border-t dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex gap-2 items-center transition-colors">
-              <div className="relative flex-1">
-                <input
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                  placeholder="Ask the local model..."
-                  className="w-full bg-white dark:bg-slate-800 dark:text-white border dark:border-slate-600 rounded-xl pl-4 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-inner transition-colors"
-                />
+            {activeTab !== 'train' && (
+              <div className="p-4 border-t dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex gap-2 items-center transition-colors">
                 <button
-                  onClick={handleSend}
-                  className="absolute right-2 top-1.5 p-1.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+                  onClick={() => setMessages([{ role: 'assistant', content: "System initialized. Ready to load 3B model and custom knowledge." }])}
+                  className="p-3 bg-white dark:bg-slate-800 text-slate-400 hover:text-red-500 border dark:border-slate-600 rounded-xl hover:bg-red-50 dark:hover:bg-red-900/20 transition-all shadow-sm"
+                  title="Clear Chat"
                 >
-                  <Send size={18} />
+                  <Trash2 size={18} />
                 </button>
+
+                <div className="relative flex-1">
+                  <input
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                    placeholder="Ask the local model..."
+                    className="w-full bg-white dark:bg-slate-800 dark:text-white border dark:border-slate-600 rounded-xl pl-4 pr-12 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 shadow-inner transition-colors"
+                  />
+                  <button
+                    onClick={handleSend}
+                    className="absolute right-2 top-1.5 p-1.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+                  >
+                    <Send size={18} />
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </main>
       </div>
     </div>
   );
 }
+
+
