@@ -98,6 +98,18 @@ npm run dev
 - In the **Model** tab, you can enter a custom System Prompt (e.g., *"You are a helpful coding assistant"*).
 - This works in tandem with your loaded adapter to steer the model's behavior.
 
+### 4. Inference Parameters
+In the **Model** tab you can tune how the model generates text. Use the **Help** tab for full descriptions.
+
+| Parameter | What it does |
+|-----------|--------------|
+| **Temperature** | Higher = more creative/random; lower = more deterministic (e.g. 0.1 for code, 0.7 for chat). |
+| **Top P** | Nucleus sampling: only sample from the top fraction of likely tokens (e.g. 0.9). |
+| **Max New Tokens** | Maximum length of each reply in tokens. |
+| **Top K** | Only sample from the top K tokens (0 = no limit). |
+| **Repetition Penalty** | Discourages repeating the same tokens (e.g. 1.1). |
+| **Min New Tokens** | Don’t stop before generating at least this many tokens. |
+
 ---
 
 ## 📂 Project Structure

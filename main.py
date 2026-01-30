@@ -59,7 +59,10 @@ class EngineState:
         self.params = {
             "temperature": 0.7,
             "top_p": 0.9,
-            "max_new_tokens": 1024
+            "max_new_tokens": 1024,
+            "top_k": 50,
+            "repetition_penalty": 1.1,
+            "min_new_tokens": 0,
         }
 
 state = EngineState()
@@ -146,6 +149,9 @@ class ModelParamsRequest(BaseModel):
     temperature: float
     top_p: float
     max_new_tokens: int
+    top_k: int = 50
+    repetition_penalty: float = 1.1
+    min_new_tokens: int = 0
 
 class LoadAdapterRequest(BaseModel):
     system_prompt: str = ""
@@ -172,10 +178,15 @@ async def load_adapter_handler(request: LoadAdapterRequest):
 
     try:
         print(f"Loading Adapter from {adapter_path}...")
-        state.model = PeftModel.from_pretrained(state.model, adapter_path)
+        # is_trainable=False for inference-only; keeps adapter frozen and avoids training state
+        state.model = PeftModel.from_pretrained(
+            state.model,
+            adapter_path,
+            is_trainable=False,
+        )
+        state.model.eval()
         state.adapter_loaded = True
         state.active_adapter = request.adapter_name or "Legacy Adapter"
-        
         state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
         print(f"Adapter loaded. System Prompt: {state.system_prompt}")
         return {"status": "Adapter loaded", "adapter": state.active_adapter}
@@ -375,7 +386,9 @@ async def get_model_status():
         "error": state.loading_error,
         "current_model": state.model_name,
         "active_adapter": state.active_adapter,
-        "adapter_loaded": state.adapter_loaded
+        "adapter_loaded": state.adapter_loaded,
+        # Thinking mode is disabled when an adapter is loaded (adapters aren't trained on <think> format)
+        "thinking_supported": not state.adapter_loaded,
     }
 
 @app.post("/v1/model/unload")
@@ -415,20 +428,29 @@ async def unload_model():
 
 @app.post("/v1/adapter/unload")
 async def unload_adapter_handler():
-    """Unloads the adapter (reverts to base model)."""
+    """Unloads the adapter and reverts to the base model for inference."""
     if not state.adapter_loaded or not state.model:
         return {"status": "No adapter active"}
 
     try:
         print("Unloading adapter...")
-        # PeftModel has 'unload()' or 'disable_adapter()'
-        # To permanently unload: model = model.unload()
+        # PEFT: unload() returns the base model with adapter removed. Use it so inference uses pure base weights.
         if hasattr(state.model, "unload"):
-             state.model = state.model.unload()
-        
+            base = state.model.unload()
+            if base is not None:
+                state.model = base
+            else:
+                # In-place unload: get the inner base transformer (e.g. base_model.model)
+                state.model = getattr(
+                    getattr(state.model, "base_model", state.model),
+                    "model",
+                    state.model,
+                )
+        state.model.eval()
         state.adapter_loaded = False
         state.active_adapter = None
-        state.system_prompt = "You are a helpful AI assistant." # Reset
+        state.system_prompt = "You are a helpful AI assistant."
+        print("Adapter unloaded. Reverted to base model.")
         return {"status": "Adapter unloaded"}
     except Exception as e:
         print(f"Error unloading adapter: {e}")
@@ -472,6 +494,9 @@ async def update_parameters(request: ModelParamsRequest):
     state.params["temperature"] = request.temperature
     state.params["top_p"] = request.top_p
     state.params["max_new_tokens"] = request.max_new_tokens
+    state.params["top_k"] = request.top_k
+    state.params["repetition_penalty"] = request.repetition_penalty
+    state.params["min_new_tokens"] = request.min_new_tokens
     print(f"Parameters updated: {state.params}")
     return {"status": "Parameters updated", "params": state.params}
 
@@ -502,7 +527,11 @@ async def chat_handler(request: ChatRequest):
         if state.tokenizer.chat_template:
             messages = [{"role": "system", "content": state.system_prompt}]
             
-            if request.enable_thinking:
+            # When an adapter is loaded, skip thinking injection — adapters are trained
+            # on direct prompt→response without <think> tags, so they stop after </think>.
+            use_thinking = request.enable_thinking and not state.adapter_loaded
+            
+            if use_thinking:
                 messages[0]["content"] += "\n\nYou MUST begin by reasoning step-by-step inside <think>...</think> tags. Do NOT speak to the user inside the tags. usage: <think>internal thought</think> final response"
                 # One-shot example to guide the model
                 messages.append({"role": "user", "content": "Hello"})
@@ -520,15 +549,18 @@ async def chat_handler(request: ChatRequest):
             input_ids = encoded.input_ids.to(state.model.device)
             attention_mask = encoded.attention_mask.to(state.model.device) if encoded.get("attention_mask") is not None else input_ids.new_ones(input_ids.shape, dtype=torch.long)
         
-        outputs = state.model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=state.params["max_new_tokens"],
-            do_sample=True,
-            temperature=state.params["temperature"],
-            top_p=state.params["top_p"],
-            pad_token_id=state.tokenizer.eos_token_id
-        )
+        gen_kwargs = {
+            "max_new_tokens": state.params["max_new_tokens"],
+            "do_sample": True,
+            "temperature": state.params["temperature"],
+            "top_p": state.params["top_p"],
+            "repetition_penalty": state.params["repetition_penalty"],
+            "min_new_tokens": state.params["min_new_tokens"],
+            "pad_token_id": state.tokenizer.eos_token_id,
+        }
+        if state.params.get("top_k", 0) > 0:
+            gen_kwargs["top_k"] = state.params["top_k"]
+        outputs = state.model.generate(input_ids, attention_mask=attention_mask, **gen_kwargs)
         
         # Decode only the new tokens? 
         # Easier to decode all and strip the prompt if we know the length, 

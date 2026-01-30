@@ -19,7 +19,14 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('chat');
   const [modelId, setModelId] = useState("stabilityai/stablelm-zephyr-3b");
   const [downloadedModels, setDownloadedModels] = useState([]);
-  const [params, setParams] = useState({ temperature: 0.7, top_p: 0.9, max_new_tokens: 200 });
+  const [params, setParams] = useState({
+    temperature: 0.7,
+    top_p: 0.9,
+    max_new_tokens: 200,
+    top_k: 50,
+    repetition_penalty: 1.1,
+    min_new_tokens: 0
+  });
   const [cacheDir, setCacheDir] = useState("");
   const [darkMode, setDarkMode] = useState(true);
   const [isThinking, setIsThinking] = useState(false);
@@ -262,7 +269,7 @@ export default function App() {
     try {
       const res = await fetch(`${API_BASE}/v1/parameters/get`);
       const data = await res.json();
-      setParams(data.params);
+      setParams((prev) => ({ ...prev, ...data.params }));
     } catch (err) {
       console.error("Failed to fetch params");
     }
@@ -350,9 +357,21 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <button
-              onClick={() => setEnableThinking(!enableThinking)}
-              className={`p-2 rounded-lg transition-colors ${enableThinking ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900/30 dark:text-indigo-400' : 'bg-gray-100 dark:bg-slate-700 text-gray-400 dark:text-gray-500 hover:bg-gray-200 dark:hover:bg-slate-600'}`}
-              title={enableThinking ? "Thinking Enabled" : "Thinking Disabled"}
+              onClick={() => !activeAdapter && setEnableThinking(!enableThinking)}
+              className={`p-2 rounded-lg transition-colors ${
+                activeAdapter
+                  ? 'bg-amber-100 text-amber-500 dark:bg-amber-900/30 dark:text-amber-400 cursor-not-allowed'
+                  : enableThinking
+                    ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900/30 dark:text-indigo-400'
+                    : 'bg-gray-100 dark:bg-slate-700 text-gray-400 dark:text-gray-500 hover:bg-gray-200 dark:hover:bg-slate-600'
+              }`}
+              title={
+                activeAdapter
+                  ? "Thinking disabled (adapter loaded — adapters use direct response)"
+                  : enableThinking
+                    ? "Thinking Enabled"
+                    : "Thinking Disabled"
+              }
             >
               <BrainCircuit size={18} />
             </button>
@@ -553,7 +572,53 @@ export default function App() {
                       <input
                         type="number"
                         value={params.max_new_tokens}
-                        onChange={(e) => setParams({ ...params, max_new_tokens: parseInt(e.target.value) })}
+                        onChange={(e) => setParams({ ...params, max_new_tokens: parseInt(e.target.value) || 0 })}
+                        className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
+                        <span>Top K</span>
+                        <span>{params.top_k === 0 ? "off" : params.top_k}</span>
+                      </div>
+                      <input
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={params.top_k}
+                        onChange={(e) => setParams({ ...params, top_k: Math.max(0, parseInt(e.target.value) || 0) })}
+                        className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        title="0 = no limit"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
+                        <span>Repetition Penalty</span>
+                        <span>{params.repetition_penalty}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1.0"
+                        max="2.0"
+                        step="0.05"
+                        value={params.repetition_penalty}
+                        onChange={(e) => setParams({ ...params, repetition_penalty: parseFloat(e.target.value) })}
+                        className="w-full accent-indigo-600 h-1 bg-gray-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
+                        <span>Min New Tokens</span>
+                      </div>
+                      <input
+                        type="number"
+                        min="0"
+                        max="512"
+                        value={params.min_new_tokens}
+                        onChange={(e) => setParams({ ...params, min_new_tokens: Math.max(0, parseInt(e.target.value) || 0) })}
                         className="w-full text-xs p-2 border dark:border-slate-600 rounded-lg bg-white dark:bg-slate-800 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
                       />
                     </div>
@@ -838,9 +903,48 @@ export default function App() {
                           <div className="text-[9px] text-slate-400 font-mono">Range: 0.1 - 1.0</div>
                         </div>
                         <p className="text-[10px] text-slate-600 dark:text-slate-300">
-                          Filters out "bad" token choices.
-                          <br />
-                          <strong>0.9 (Default)</strong> means the model considers the top 90% most likely words. Lowering this makes the model more repetitive but focused.
+                          Sample only from the smallest set of tokens whose cumulative probability exceeds this value.
+                          <strong> 0.9 (Default)</strong> means the model considers the top 90% most likely words. Lower values make output more focused; higher values allow more diversity.
+                        </p>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 border dark:border-slate-700 rounded-lg p-3 shadow-sm">
+                        <div className="flex justify-between items-center mb-1">
+                          <div className="text-xs font-bold text-slate-700 dark:text-slate-300">Max New Tokens</div>
+                          <div className="text-[9px] text-slate-400 font-mono">Integer</div>
+                        </div>
+                        <p className="text-[10px] text-slate-600 dark:text-slate-300">
+                          Maximum number of tokens the model can generate in one reply. Higher values allow longer answers but use more memory and time. Typical range: 100–1024.
+                        </p>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 border dark:border-slate-700 rounded-lg p-3 shadow-sm">
+                        <div className="flex justify-between items-center mb-1">
+                          <div className="text-xs font-bold text-emerald-600 dark:text-emerald-400">Top K</div>
+                          <div className="text-[9px] text-slate-400 font-mono">0 = off, 1–100</div>
+                        </div>
+                        <p className="text-[10px] text-slate-600 dark:text-slate-300">
+                          Sample only from the top K most likely tokens. <strong>0 = no limit</strong> (default 50 when enabled). Lower values reduce nonsense; too low can make output repetitive.
+                        </p>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 border dark:border-slate-700 rounded-lg p-3 shadow-sm">
+                        <div className="flex justify-between items-center mb-1">
+                          <div className="text-xs font-bold text-amber-600 dark:text-amber-400">Repetition Penalty</div>
+                          <div className="text-[9px] text-slate-400 font-mono">Range: 1.0 - 2.0</div>
+                        </div>
+                        <p className="text-[10px] text-slate-600 dark:text-slate-300">
+                          Penalizes tokens that have already appeared. <strong>1.1 (Default)</strong> gently discourages loops; higher values (e.g. 1.2–1.5) reduce repetition more aggressively. Use 1.0 for no penalty.
+                        </p>
+                      </div>
+
+                      <div className="bg-white dark:bg-slate-800 border dark:border-slate-700 rounded-lg p-3 shadow-sm">
+                        <div className="flex justify-between items-center mb-1">
+                          <div className="text-xs font-bold text-cyan-600 dark:text-cyan-400">Min New Tokens</div>
+                          <div className="text-[9px] text-slate-400 font-mono">0 - 512</div>
+                        </div>
+                        <p className="text-[10px] text-slate-600 dark:text-slate-300">
+                          Minimum number of tokens to generate before the model is allowed to stop. Use this to avoid very short or cut-off answers. <strong>0 (Default)</strong> means no minimum.
                         </p>
                       </div>
                     </div>
