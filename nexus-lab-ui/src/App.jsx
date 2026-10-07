@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { BrainCircuit, MessageSquare, FlaskConical, Settings, BookOpen, Sun, Moon, Cpu } from 'lucide-react';
-import { api, splitThinking, DEFAULT_PARAMS } from './api';
+import { api, splitThinking, formatBytes, DEFAULT_PARAMS } from './api';
 import { Toasts } from './components/ui';
 import ModelPicker from './components/ModelPicker';
 import ChatView from './components/ChatView';
@@ -17,7 +17,7 @@ const NAV = [
 
 const DEVICE_LABELS = { cuda: 'NVIDIA GPU', mps: 'Apple GPU', cpu: 'CPU' };
 const LOADING = ['starting', 'downloading', 'loading'];
-const IDLE_STATUS = { status: 'idle', progress: 0, error: '', current_model: null, active_adapter: null, device: null, system_prompt: '', is_training: false };
+const IDLE_STATUS = { status: 'idle', progress: 0, error: '', current_model: null, active_adapter: null, adapter_supports_thinking: false, thinking_supported: true, device: null, system_prompt: '', is_training: false };
 const IDLE_METRICS = { loss: 0, step: 0, perplexity: 0, status: 'Idle', progress: 0, loss_history: [], error: '' };
 
 function stored(key, fallback) {
@@ -48,10 +48,12 @@ export default function App() {
   const [online, setOnline] = useState(true);
   const [status, setStatus] = useState(IDLE_STATUS);
   const [models, setModels] = useState([]);
+  const [modelSizes, setModelSizes] = useState({});
   const [adapters, setAdapters] = useState([]);
   const [params, setParams] = useState(DEFAULT_PARAMS);
   const [cacheDir, setCacheDir] = useState('');
-  const [dataset, setDataset] = useState({ total: 0, eligible: 0, entries: [] });
+  const [hfToken, setHfToken] = useState({ configured: false, valid: false, username: null, from_environment: false });
+  const [dataset, setDataset] = useState({ total: 0, eligible: 0, thinking: 0, entries: [] });
   const [metrics, setMetrics] = useState(IDLE_METRICS);
 
   const [messages, setMessages] = useState([]);
@@ -88,8 +90,11 @@ export default function App() {
     }
   }, []);
 
-  const refreshModels = useCallback(() => api.models().then((d) => setModels(d.models || [])).catch(() => {}), []);
-  const refreshAdapters = useCallback(() => api.adapters().then((d) => setAdapters(d.adapters || [])).catch(() => {}), []);
+  const refreshModels = useCallback(() => api.models().then((d) => {
+    setModels(d.models || []);
+    setModelSizes(Object.fromEntries((d.details || []).map((m) => [m.id, m.size_bytes])));
+  }).catch(() => {}), []);
+  const refreshAdapters = useCallback(() => api.adapters().then((d) => setAdapters(d.details || (d.adapters || []).map((name) => ({ name, supports_thinking: false })))).catch(() => {}), []);
   const refreshDataset = useCallback(() => api.dataset().then(setDataset).catch(() => {}), []);
 
   // The backend is the source of truth: poll it, faster while something is in progress
@@ -107,13 +112,15 @@ export default function App() {
     refreshDataset();
     api.params().then((d) => setParams((p) => ({ ...p, ...d.params }))).catch(() => {});
     api.settings().then((d) => setCacheDir(d.cache_dir || '')).catch(() => {});
+    api.hfToken().then(setHfToken).catch(() => {});
     api.metrics().then((d) => setMetrics({ ...IDLE_METRICS, ...d.metrics })).catch(() => {});
   }, [online, refreshModels, refreshDataset]);
 
-  const applyAdapter = useCallback(async (name) => {
+  // supportsThinking: null uses what training recorded for the adapter
+  const applyAdapter = useCallback(async (name, supportsThinking = null) => {
     try {
-      const data = await api.loadAdapter(name);
-      toast('success', `Adapter “${data.adapter}” is active.`);
+      const data = await api.loadAdapter(name, supportsThinking);
+      toast('success', `Adapter “${data.adapter}” is active${data.supports_thinking ? ' with its own thinking' : ''}.`);
     } catch (err) {
       toast('error', `Could not load the adapter: ${err.message}`);
     }
@@ -136,7 +143,7 @@ export default function App() {
     }
     if (LOADING.includes(prev.status) && status.status === 'error') {
       pendingAdapter.current = null;
-      toast('error', `Model failed to load: ${status.error || 'unknown error'}`);
+      toast('error', 'The model failed to load. Details are under the model selector.');
     }
   }, [status, toast, refreshAdapters, refreshModels, applyAdapter]);
 
@@ -167,10 +174,30 @@ export default function App() {
   const loadModel = async (id) => {
     try {
       await api.loadModel(id);
-      setStatus((s) => ({ ...s, status: 'starting', progress: 0, error: '' }));
+      setStatus((s) => ({ ...s, status: 'starting', progress: 0, error: '', load: { model: id, stage: null, download: {} } }));
     } catch (err) {
       toast('error', `Could not start loading: ${err.message}`);
     }
+  };
+
+  const cancelDownload = async () => {
+    try {
+      await api.cancelLoad();
+      toast('info', 'Download cancelled.');
+    } catch (err) {
+      toast('error', `Could not cancel: ${err.message}`);
+    }
+    refreshStatus();
+  };
+
+  const deleteModel = async (id) => {
+    try {
+      const data = await api.deleteModel(id);
+      toast('success', `Deleted ${id} (${formatBytes(data.freed_bytes)} freed).`);
+    } catch (err) {
+      toast('error', `Could not delete ${id}: ${err.message}`);
+    }
+    refreshModels();
   };
 
   const unloadModel = async () => {
@@ -183,9 +210,9 @@ export default function App() {
     refreshStatus();
   };
 
-  const loadAdapter = async (name) => {
+  const loadAdapter = async (name, supportsThinking = null) => {
     if (status.active_adapter) await api.unloadAdapter().catch(() => {});
-    await applyAdapter(name);
+    await applyAdapter(name, supportsThinking);
   };
 
   const unloadAdapter = async () => {
@@ -224,7 +251,7 @@ export default function App() {
     setMessages([...base, { role: 'user', content: text }]);
     setBusy(true);
     try {
-      const data = await api.chat(text, history, thinking && !status.active_adapter);
+      const data = await api.chat(text, history, thinking && status.thinking_supported);
       const failed = data.content.startsWith('Error during inference') || data.content.startsWith('System: No model loaded');
       setMessages((prev) => [...prev, failed
         ? { role: 'error', content: data.content.replace(/^System: /, '') }
@@ -249,7 +276,8 @@ export default function App() {
         message_id: message.id,
         score: direction === 'up' ? 10 : 2,
         prompt: message.prompt,
-        response: splitThinking(message.content).answer,
+        // A thinking adapter learns from its reasoning too, so keep the <think> block for it
+        response: status.adapter_supports_thinking ? message.content.trim() : splitThinking(message.content).answer,
       });
       setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, rating: direction } : m)));
       if (direction === 'up') refreshDataset();
@@ -310,6 +338,28 @@ export default function App() {
     }
   };
 
+  // Returns true on success so the form can clear the field
+  const saveHfToken = async (token) => {
+    try {
+      const data = await api.setHfToken(token);
+      setHfToken(data);
+      toast('success', `Hugging Face token saved for ${data.username}.`);
+      return true;
+    } catch (err) {
+      toast('error', err.message);
+      return false;
+    }
+  };
+
+  const removeHfToken = async () => {
+    try {
+      setHfToken(await api.removeHfToken());
+      toast('info', 'Hugging Face token removed from this machine.');
+    } catch (err) {
+      toast('error', `Could not remove the token: ${err.message}`);
+    }
+  };
+
   const saveCacheDir = async (dir) => {
     try {
       const data = await api.setSettings(dir);
@@ -343,7 +393,7 @@ export default function App() {
           <span className="hidden text-[15px] font-semibold tracking-tight sm:inline">NexusAI</span>
         </div>
 
-        <ModelPicker status={status} models={models} online={online} open={pickerOpen} setOpen={setPickerOpen} onLoad={loadModel} onUnload={unloadModel} />
+        <ModelPicker status={status} models={models} sizes={modelSizes} online={online} open={pickerOpen} setOpen={setPickerOpen} onLoad={loadModel} onUnload={unloadModel} onCancelDownload={cancelDownload} onDelete={deleteModel} onOpenSettings={() => setView('settings')} />
 
         <div className="ml-auto flex shrink-0 items-center gap-2">
           {isTraining && (
@@ -457,6 +507,9 @@ export default function App() {
               zoom={zoom}
               onZoom={setZoom}
               modelCount={models.length}
+              hfToken={hfToken}
+              onSaveHfToken={saveHfToken}
+              onRemoveHfToken={removeHfToken}
             />
           )}
           {view === 'help' && <HelpView onGo={setView} />}

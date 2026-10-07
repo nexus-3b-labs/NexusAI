@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { X, Zap, RotateCcw } from 'lucide-react';
+import { X, Zap, RotateCcw, Brain } from 'lucide-react';
 import { Button, IconButton, Label, inputClass } from './ui';
 import { DEFAULT_PARAMS } from '../api';
 
@@ -72,7 +72,10 @@ export default function ConfigPanel({
   status, adapters, params, onParamsChange, onSystemPrompt, onLoadAdapter, onUnloadAdapter, onGoTrain, onClose,
 }) {
   const [picked, setPicked] = useState('');
-  const selectedAdapter = adapters.includes(picked) ? picked : adapters[0] || '';
+  const selected = adapters.find((a) => a.name === picked) || adapters[0];
+  // null = follow what training recorded; the checkbox lets the user override it
+  const [thinkingOverride, setThinkingOverride] = useState(null);
+  const selectedThinks = thinkingOverride ?? !!selected?.supports_thinking;
 
   const modelReady = !!status.current_model;
 
@@ -104,15 +107,44 @@ export default function ConfigPanel({
               <button onClick={onGoTrain} className="font-medium text-accent hover:underline">Train one</button>
             </p>
           ) : (
-            <div className="flex gap-2">
-              <select value={selectedAdapter} onChange={(e) => setPicked(e.target.value)} className={`${inputClass} font-mono text-[13px]`}>
-                {adapters.map((a) => <option key={a} value={a}>{a}</option>)}
-              </select>
-              <Button size="sm" variant="primary" className="h-auto" onClick={() => onLoadAdapter(selectedAdapter)}>Apply</Button>
-            </div>
+            <>
+              <div className="flex gap-2">
+                <select
+                  value={selected.name}
+                  onChange={(e) => { setPicked(e.target.value); setThinkingOverride(null); }}
+                  aria-label="Adapter"
+                  className={`${inputClass} font-mono text-[13px]`}
+                >
+                  {adapters.map((a) => <option key={a.name} value={a.name}>{a.name}{a.supports_thinking ? ' (thinking)' : ''}</option>)}
+                </select>
+                <Button size="sm" variant="primary" className="h-auto" onClick={() => onLoadAdapter(selected.name, selectedThinks)}>Apply</Button>
+              </div>
+              <label className="mt-2.5 flex cursor-pointer items-start gap-2 text-xs text-muted">
+                <input
+                  type="checkbox"
+                  checked={selectedThinks}
+                  onChange={(e) => setThinkingOverride(e.target.checked)}
+                  className="mt-0.5 accent-[var(--accent)]"
+                />
+                <span>
+                  Trained with <code className="font-mono text-ink">&lt;think&gt;</code> examples
+                  <span className="block text-faint">
+                    {selected.supports_thinking
+                      ? 'Detected from its training data.'
+                      : 'Not detected. Tick only if this adapter’s training replies contained their own reasoning.'}
+                  </span>
+                </span>
+              </label>
+            </>
           )}
           {status.active_adapter && (
-            <p className="mt-2 text-xs text-faint">Thinking mode is off while an adapter is active, because adapters are trained on direct replies.</p>
+            <p className="mt-2 flex items-start gap-1.5 text-xs text-faint">
+              {status.adapter_supports_thinking ? (
+                <><Brain size={12} className="mt-0.5 shrink-0 text-accent" /> Thinking adapter: with thinking on, it reasons in its own trained voice. No instructions are injected.</>
+              ) : (
+                'Direct-reply adapter: thinking is locked off, because it was not trained with <think> examples.'
+              )}
+            </p>
           )}
         </Section>
 

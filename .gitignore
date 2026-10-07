@@ -5,3 +5,6 @@ __pycache__
 /nexus_adapters/*
 /status*.json
 /training_data.jsonl
+
+/venv/
+/.claude/

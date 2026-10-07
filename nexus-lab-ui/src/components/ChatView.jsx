@@ -74,7 +74,9 @@ export default function ChatView({
 
   const modelReady = !!status.current_model;
   const adapterActive = !!status.active_adapter;
-  const thinkingOn = thinking && !adapterActive;
+  // Locked off only for adapters that were not trained with <think> examples
+  const thinkingLocked = adapterActive && !status.thinking_supported;
+  const thinkingOn = thinking && !thinkingLocked;
   const canSend = modelReady && !busy && input.trim().length > 0;
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }); }, [messages, busy]);
@@ -203,9 +205,13 @@ export default function ChatView({
           <div className="mt-1 flex items-center justify-between gap-2">
             <button
               onClick={onToggleThinking}
-              disabled={adapterActive}
+              disabled={thinkingLocked}
               aria-pressed={thinkingOn}
-              title={adapterActive ? 'Unavailable while an adapter is active' : 'Ask the model to reason step by step before answering'}
+              title={thinkingLocked
+                ? 'This adapter was trained on direct replies, so it cannot think'
+                : adapterActive
+                  ? 'The adapter reasons in its own trained voice before answering'
+                  : 'Ask the model to reason step by step before answering'}
               className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors disabled:opacity-50 ${thinkingOn ? 'border-accent bg-accent-soft text-accent' : 'border-line text-muted hover:text-ink'}`}
             >
               <Brain size={13} /> Thinking {thinkingOn ? 'on' : 'off'}
