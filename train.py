@@ -18,6 +18,7 @@ DEFAULT_MODEL_ID = "stabilityai/stablelm-zephyr-3b"
 DATA_FILE = "training_data.jsonl"
 OUTPUT_DIR = "nexus_adapters"
 MAX_LENGTH = 512
+NUM_EPOCHS = 3
 
 class ProgressCallback(TrainerCallback):
     """Custom callback to report metrics to the backend state."""
@@ -64,8 +65,7 @@ def load_data(data_path):
                     entry = json.loads(line)
                     # Data Filtering Logic (Score > 7)
                     if entry.get("score", 0) >= 7 and entry.get("prompt") and entry.get("response"):
-                        text = f"<|user|>\n{entry['prompt']}<|endoftext|>\n<|assistant|>\n{entry['response']}<|endoftext|>"
-                        data.append({"text": text})
+                        data.append({"prompt": entry["prompt"], "response": entry["response"]})
                 except:
                     continue
     except FileNotFoundError:
@@ -74,6 +74,17 @@ def load_data(data_path):
     
     print(f"Loaded {len(data)} high-quality training examples.")
     return data
+
+def format_example(tokenizer, prompt, response):
+    """Returns (prefix, full_text) in the same chat format the model sees at inference time."""
+    if tokenizer.chat_template:
+        prefix = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,  # adapters answer directly; matches inference with an adapter loaded
+        )
+    else:
+        prefix = f"<|user|>\n{prompt}<|endoftext|>\n<|assistant|>\n"
+    return prefix, prefix + response + tokenizer.eos_token
 
 def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTPUT_DIR, progress_callback=None, cache_dir=None):
     """
@@ -108,24 +119,29 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
         )
         tokenizer.pad_token = tokenizer.eos_token
 
+        # Prompt masking below assumes the prompt sits at the start of the sequence
+        tokenizer.padding_side = "right"
+
         def tokenize_function(examples):
-            # Tokenize full sequences
+            prefixes, texts = [], []
+            for prompt, response in zip(examples["prompt"], examples["response"]):
+                prefix, text = format_example(tokenizer, prompt, response)
+                prefixes.append(prefix)
+                texts.append(text)
             full_enc = tokenizer(
-                examples["text"],
+                texts,
                 padding="max_length",
                 truncation=True,
                 max_length=MAX_LENGTH
             )
-            # Mask prompt tokens so loss is only on assistant response (instruction-tuning best practice)
+            # Loss only on the assistant response: mask prompt tokens and padding
             labels = []
-            for i, text in enumerate(examples["text"]):
-                if "<|assistant|>\n" in text:
-                    prefix = text.split("<|assistant|>\n", 1)[0] + "<|assistant|>\n"
-                    prefix_enc = tokenizer(prefix, truncation=True, max_length=MAX_LENGTH)
-                    plen = len(prefix_enc["input_ids"])
-                else:
-                    plen = 0
-                lab = list(full_enc["input_ids"][i])
+            for i, prefix in enumerate(prefixes):
+                plen = len(tokenizer(prefix, truncation=True, max_length=MAX_LENGTH)["input_ids"])
+                lab = [
+                    tok if mask else -100
+                    for tok, mask in zip(full_enc["input_ids"][i], full_enc["attention_mask"][i])
+                ]
                 for j in range(min(plen, len(lab))):
                     lab[j] = -100
                 labels.append(lab)
@@ -161,12 +177,13 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
                 )
         else:
             print(f"Using fp16 for {device} (Quantization disabled).")
+            # Load on CPU, then move in one step (threaded device placement hangs on MPS)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                device_map=device,
                 torch_dtype=torch.float16,
                 **kwargs_common
             )
+            model.to(device)
 
         # Apply LoRA
         print("Applying LoRA Config...")
@@ -184,7 +201,7 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
             output_dir=output_dir,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=4,
-            num_train_epochs=3,
+            num_train_epochs=NUM_EPOCHS,
             learning_rate=2e-4,
             logging_steps=1,
             save_strategy="epoch",
