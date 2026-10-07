@@ -11,7 +11,8 @@ Designed for developers and hobbyists who want to explore **LoRA (Low-Rank Adapt
 ### 💬 **Interactive Chat Interface**
 - **Local Inference**: Run models like `SystemZephyr-3B` or `Qwen` entirely offline.
 - **Chain-of-Thought Visualization**: See the "hidden" reasoning steps of the model with a collapsible **Thinking Process** UI.
-- **Customizable UI**: Dark Mode, Resizable Sidebar, and Font Size zooming for accessibility.
+- **Conversation Memory**: Earlier turns are sent with each message, so the model keeps context.
+- **Customizable UI**: Light and dark themes, a resizable configuration panel, and adjustable text size.
 
 ### 🛠️ **No-Code Fine-Tuning**
 - **Train Custom Adapters**: Upload a `training_data.jsonl` file and train the model on your own data.
@@ -79,10 +80,10 @@ npm run dev
 ## 📖 Usage Guide
 
 ### 1. Chatting with the Model
-- Open the **Chat** tab.
-- By default, it loads a base model.
-- Type your message and hit Enter.
-- Click the **"T"** icon in the navbar to adjust font size if needed.
+- Pick a model in the **selector in the top bar**. Downloaded models are listed; paste a Hugging Face ID (`org/model`) to fetch a new one.
+- Type your message and hit Enter (Shift+Enter adds a new line).
+- Rate replies with the thumbs: a thumbs-up saves the prompt and reply to your training dataset.
+- Text size and theme live in **Settings**.
 
 ### 2. Fine-Tuning a New Persona
 1.  **Prepare Data**: Create a file named `training_data.jsonl`.
@@ -90,16 +91,17 @@ npm run dev
     {"prompt": "hi", "response": "Hey you 😊 I was hoping you'd show up. How’s your day going so far?", "score": 10, "source": "human_feedback"}
     {"prompt": "hello", "response": "Hi! It’s nice to see you here. What are we talking about today?", "score": 9, "source": "human_feedback"}
     ```
-2.  **Train**: Go to the **Train** tab and click **"Start Training"**.
-3.  **Wait**: Monitor the progress bar.
-4.  **Load**: Once finished, go to the **Model** tab and select your new adapter from the list.
+2.  **Add it**: Go to **Train**, paste or import the file under **Dataset**, and click **Add to dataset**.
+3.  **Train**: Choose the base model and an adapter name, then click **Start training**.
+4.  **Wait**: Monitor the progress bar and loss curve.
+5.  **Load**: Once finished, click **Try in Chat**, or pick the adapter in the Chat **Configuration** panel.
 
 ### 3. Using System Prompts
-- In the **Model** tab, you can enter a custom System Prompt (e.g., *"You are a helpful coding assistant"*).
+- In the Chat **Configuration** panel (the sliders icon), you can enter a custom System Prompt (e.g., *"You are a helpful coding assistant"*).
 - This works in tandem with your loaded adapter to steer the model's behavior.
 
 ### 4. Inference Parameters
-In the **Model** tab you can tune how the model generates text. Use the **Help** tab for full descriptions.
+In the Chat **Configuration** panel you can tune how the model generates text; changes apply automatically. Use the **Guide** section for full descriptions.
 
 | Parameter | What it does |
 |-----------|--------------|
@@ -122,7 +124,9 @@ NexusAI/
 ├── nexus_adapters/         # Storage for trained LoRA adapters
 ├── nexus-lab-ui/           # Frontend React Application
 │   ├── src/
-│   │   ├── App.jsx         # Main UI Logic
+│   │   ├── App.jsx         # App shell and state
+│   │   ├── api.js          # Backend API client
+│   │   ├── components/     # Chat, Train, model picker, config panel
 │   │   └── ...
 │   └── ...
 └── README.md               # You are here

@@ -17,8 +17,28 @@ import threading
 import os
 import gc
 import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Import the training module (Make sure dependencies are installed)
+try:
+    import train as train_module
+except ImportError:
+    train_module = None
+
+TOTAL_EPOCHS = getattr(train_module, "NUM_EPOCHS", 3)
+DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant."
 
 app = FastAPI(title="Nexus 3B Backend")
+
+# All model work (loading, generation, adapters) runs on this single thread. It keeps the
+# event loop free for status/metrics polling and serialises access to the model, which is
+# not thread-safe (PyTorch on MPS crashes when driven from several threads).
+model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model")
+
+
+def _on_model_thread(fn, *args, **kwargs):
+    return asyncio.get_running_loop().run_in_executor(model_executor, lambda: fn(*args, **kwargs))
 
 # Enable CORS for frontend integration
 app.add_middleware(
@@ -33,7 +53,7 @@ app.add_middleware(
 class EngineState:
     def __init__(self):
         self.is_training = False
-        self.metrics = {"loss": 0.0, "step": 0, "perplexity": 0.0}
+        self.metrics = _fresh_metrics("Idle")
         self.knowledge_base = []
         self.feedback_log = []
         # Model state
@@ -43,7 +63,7 @@ class EngineState:
         self.adapter_loaded = False
         self.active_adapter = None
         # Default system prompt
-        self.system_prompt = "You are a helpful AI assistant."
+        self.system_prompt = DEFAULT_SYSTEM_PROMPT
 
         
         # Loading state
@@ -65,13 +85,35 @@ class EngineState:
             "min_new_tokens": 0,
         }
 
+def _detect_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _fresh_metrics(status):
+    return {
+        "loss": 0.0, "step": 0, "perplexity": 0.0, "status": status,
+        "progress": 0.0, "total_epochs": TOTAL_EPOCHS, "loss_history": [],
+        "error": "", "model": None, "adapter": None,
+    }
+
+
 state = EngineState()
 
 # --- Schemas ---
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
     enable_thinking: bool = True
+    # Earlier turns of the conversation (oldest first), so the model has context
+    history: list[ChatMessage] = []
 
 class ScoreRequest(BaseModel):
     message_id: str
@@ -139,6 +181,76 @@ async def upload_training_data(request: TrainingDataRequest):
                 
     return {"status": "Data uploaded", "added": added_count}
 
+def _data_file():
+    return os.path.join(_project_root(), "training_data.jsonl")
+
+
+def _read_data_lines():
+    path = _data_file()
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        return f.read().splitlines()
+
+
+@app.get("/v1/training/data")
+async def get_training_data():
+    """Lists every example in the dataset, newest first. `line` identifies an entry for deletion."""
+    entries = []
+    for line_no, line in enumerate(_read_data_lines()):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("prompt") and entry.get("response"):
+            score = entry.get("score", 0)
+            entries.append({
+                "line": line_no,
+                "prompt": entry["prompt"],
+                "response": entry["response"],
+                "score": score,
+                "source": entry.get("source", ""),
+                # Same filter train.py applies
+                "usable": score >= 7,
+            })
+    eligible = sum(1 for e in entries if e["usable"])
+    return {"total": len(entries), "eligible": eligible, "entries": entries[::-1]}
+
+
+class DeleteExampleRequest(BaseModel):
+    # The prompt the caller saw on that line; guards against deleting the wrong
+    # entry if the file changed since it was listed.
+    prompt: str
+
+
+@app.post("/v1/training/data/{line_no}/delete")
+async def delete_training_example(line_no: int, request: DeleteExampleRequest):
+    """Removes one example from the dataset."""
+    if state.is_training:
+        raise HTTPException(status_code=409, detail="Training is running. Wait for it to finish before editing the dataset.")
+    lines = _read_data_lines()
+    try:
+        entry = json.loads(lines[line_no]) if 0 <= line_no < len(lines) else None
+    except json.JSONDecodeError:
+        entry = None
+    if not isinstance(entry, dict) or entry.get("prompt") != request.prompt:
+        raise HTTPException(status_code=409, detail="The dataset changed. Refresh and try again.")
+    del lines[line_no]
+    with open(_data_file(), "w") as f:
+        f.write("".join(line + "\n" for line in lines))
+    return {"status": "Example deleted"}
+
+
+@app.post("/v1/training/data/clear")
+async def clear_training_data():
+    """Removes every example from the dataset."""
+    if state.is_training:
+        raise HTTPException(status_code=409, detail="Training is running. Wait for it to finish before editing the dataset.")
+    removed = len(_read_data_lines())
+    if os.path.exists(_data_file()):
+        os.remove(_data_file())
+    return {"status": "Dataset cleared", "removed": removed}
+
 class LoadModelRequest(BaseModel):
     model_id: str
 
@@ -156,6 +268,15 @@ class ModelParamsRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     system_prompt: str = ""
     adapter_name: str = ""
+
+class SystemPromptRequest(BaseModel):
+    system_prompt: str = ""
+
+@app.post("/v1/system_prompt")
+async def set_system_prompt(request: SystemPromptRequest):
+    """Sets the system prompt for the base model or the active adapter."""
+    state.system_prompt = request.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT
+    return {"status": "System prompt updated", "system_prompt": state.system_prompt}
 
 @app.post("/v1/adapter/load")
 async def load_adapter_handler(request: LoadAdapterRequest):
@@ -179,7 +300,8 @@ async def load_adapter_handler(request: LoadAdapterRequest):
     try:
         print(f"Loading Adapter from {adapter_path}...")
         # is_trainable=False for inference-only; keeps adapter frozen and avoids training state
-        state.model = PeftModel.from_pretrained(
+        state.model = await _on_model_thread(
+            PeftModel.from_pretrained,
             state.model,
             adapter_path,
             is_trainable=False,
@@ -187,7 +309,9 @@ async def load_adapter_handler(request: LoadAdapterRequest):
         state.model.eval()
         state.adapter_loaded = True
         state.active_adapter = request.adapter_name or "Legacy Adapter"
-        state.system_prompt = request.system_prompt if request.system_prompt else "You are a helpful AI assistant."
+        # Keep the current system prompt unless the caller sends a new one
+        if request.system_prompt:
+            state.system_prompt = request.system_prompt
         print(f"Adapter loaded. System Prompt: {state.system_prompt}")
         return {"status": "Adapter loaded", "adapter": state.active_adapter}
     except Exception as e:
@@ -218,12 +342,6 @@ async def list_adapters():
 
 # --- Logic: Training Loop ---
 
-# Import the training module (Make sure dependencies are installed)
-try:
-    import train as train_module
-except ImportError:
-    train_module = None
-
 import subprocess
 import sys
 
@@ -238,7 +356,9 @@ def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, c
     This ensures proper memory reclamation (OS kills the process).
     """
     state.is_training = True
-    state.metrics = {"loss": 0.0, "step": 0, "perplexity": 0.0, "status": "Starting..."}
+    state.metrics = _fresh_metrics("Starting...")
+    state.metrics["model"] = model_id
+    state.metrics["adapter"] = adapter_name
     
     print(f"Starting Real Training (Subprocess) for {model_id} -> {adapter_name}...")
     
@@ -283,8 +403,11 @@ def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, c
                     if "loss" in logs:
                         state.metrics["loss"] = logs["loss"]
                         state.metrics["perplexity"] = 2.718 ** logs["loss"]
+                        state.metrics["loss_history"].append(logs["loss"])
+                        state.metrics["status"] = "Training..."
                     if "epoch" in logs:
                         state.metrics["step"] = logs["epoch"]
+                        state.metrics["progress"] = min(100.0, 100.0 * logs["epoch"] / TOTAL_EPOCHS)
                         
                 except:
                     pass
@@ -298,20 +421,25 @@ def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, c
                  state.metrics["status"] = "Tokenizing..."
             elif "Saving adapters" in line:
                  state.metrics["status"] = "Saving Weights..."
+            elif line.startswith(("Training Error:", "Error:", "No training data")):
+                 state.metrics["error"] = line
 
         # Wait for finish
         ret_code = process.wait()
         
         if ret_code == 0:
             state.metrics["status"] = "Complete"
+            state.metrics["progress"] = 100.0
             print("Training subprocess finished successfully.")
         else:
             state.metrics["status"] = "Failed"
+            state.metrics["error"] = state.metrics["error"] or f"Training process exited with code {ret_code}"
             print(f"Training subprocess failed with code {ret_code}")
             
     except Exception as e:
         print(f"Training launch failed: {e}")
-        state.metrics["status"] = f"Error: {str(e)}"
+        state.metrics["status"] = "Failed"
+        state.metrics["error"] = str(e)
     
     state.is_training = False
 
@@ -325,13 +453,14 @@ def _background_model_load(model_id: str):
         state.loading_status = "downloading"
         state.loading_progress = 10.0
         
-        # Determine device first
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-            
+        device = _detect_device()
+
+        # A new base model replaces whatever was loaded, including its adapter
+        state.model = None
+        state.model_name = None
+        state.adapter_loaded = False
+        state.active_adapter = None
+
         state.loading_progress = 20.0
         
         # Load Tokenizer
@@ -349,10 +478,12 @@ def _background_model_load(model_id: str):
         state.model = AutoModelForCausalLM.from_pretrained(
             model_id, 
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
-            device_map=device,
             cache_dir=state.cache_dir,
             trust_remote_code=True
         )
+        # Load on CPU, then move in one step: newer transformers copies weights to the
+        # device from several threads at once, which hangs on MPS.
+        state.model.to(device)
         state.model_name = model_id
         
         state.loading_progress = 100.0
@@ -365,9 +496,9 @@ def _background_model_load(model_id: str):
         state.loading_error = str(e)
 
 @app.post("/v1/model/load")
-async def load_model_handler(request: LoadModelRequest, background_tasks: BackgroundTasks):
+async def load_model_handler(request: LoadModelRequest):
     """Triggers background model loading."""
-    if state.loading_status in ["downloading", "loading"]:
+    if state.loading_status in ["starting", "downloading", "loading"]:
         raise HTTPException(status_code=400, detail="Model already loading.")
     
     # Reset state
@@ -375,7 +506,7 @@ async def load_model_handler(request: LoadModelRequest, background_tasks: Backgr
     state.loading_progress = 0.0
     state.loading_error = ""
     
-    background_tasks.add_task(_background_model_load, request.model_id)
+    model_executor.submit(_background_model_load, request.model_id)
     return {"status": "Loading started", "model": request.model_id}
 
 @app.get("/v1/model/status")
@@ -385,6 +516,9 @@ async def get_model_status():
         "progress": state.loading_progress,
         "error": state.loading_error,
         "current_model": state.model_name,
+        "device": _detect_device(),
+        "system_prompt": state.system_prompt,
+        "is_training": state.is_training,
         "active_adapter": state.active_adapter,
         "adapter_loaded": state.adapter_loaded,
         # Thinking mode is disabled when an adapter is loaded (adapters aren't trained on <think> format)
@@ -401,6 +535,8 @@ async def unload_model():
     state.model = None
     state.tokenizer = None
     state.model_name = None
+    state.adapter_loaded = False
+    state.active_adapter = None
     state.loading_status = "idle"
     state.loading_progress = 0.0
     
@@ -436,7 +572,7 @@ async def unload_adapter_handler():
         print("Unloading adapter...")
         # PEFT: unload() returns the base model with adapter removed. Use it so inference uses pure base weights.
         if hasattr(state.model, "unload"):
-            base = state.model.unload()
+            base = await _on_model_thread(state.model.unload)
             if base is not None:
                 state.model = base
             else:
@@ -449,7 +585,6 @@ async def unload_adapter_handler():
         state.model.eval()
         state.adapter_loaded = False
         state.active_adapter = None
-        state.system_prompt = "You are a helpful AI assistant."
         print("Adapter unloaded. Reverted to base model.")
         return {"status": "Adapter unloaded"}
     except Exception as e:
@@ -509,6 +644,10 @@ async def chat_handler(request: ChatRequest):
     """
     Handles inference. Uses local model if loaded, otherwise falls back to mock.
     """
+    return await _on_model_thread(_generate_reply, request)
+
+
+def _generate_reply(request: ChatRequest):
     msg_id = str(uuid.uuid4())
     
     # 1. Fallback if no model loaded
@@ -539,8 +678,15 @@ async def chat_handler(request: ChatRequest):
             else:
                 messages[0]["content"] += "\n\nAnswer directly without showing your thinking process."
 
+            for turn in request.history:
+                if turn.role in ("user", "assistant") and turn.content.strip():
+                    messages.append({"role": turn.role, "content": turn.content})
             messages.append({"role": "user", "content": request.message})
-            input_ids = state.tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(state.model.device)
+            # enable_thinking is read by templates with native reasoning (e.g. Qwen3) and ignored by the rest
+            input_ids = state.tokenizer.apply_chat_template(
+                messages, return_tensors="pt", add_generation_prompt=True, return_dict=False,
+                enable_thinking=use_thinking,
+            ).to(state.model.device)
             # Explicit attention_mask (all 1s for single sequence) so the model doesn't warn when pad_token_id == eos_token_id
             attention_mask = input_ids.new_ones(input_ids.shape, dtype=torch.long)
         else:
@@ -598,6 +744,9 @@ async def start_training(request: StartTrainingRequest, background_tasks: Backgr
     adapter_name = request.adapter_name or "nexus_adapter"
     
     data_path = os.path.join(_project_root(), "training_data.jsonl")
+    if not os.path.exists(data_path) or os.path.getsize(data_path) == 0:
+        raise HTTPException(status_code=400, detail="No training data yet. Add examples to the dataset first.")
+    state.is_training = True  # set before returning so the UI's first poll sees it
     background_tasks.add_task(real_training_loop, target_model, adapter_name, data_path, state.cache_dir)
     return {"status": "Training started", "model": target_model, "adapter": adapter_name}
 
