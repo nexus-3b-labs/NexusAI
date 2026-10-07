@@ -100,7 +100,29 @@ npm run dev
 - In the Chat **Configuration** panel (the sliders icon), you can enter a custom System Prompt (e.g., *"You are a helpful coding assistant"*).
 - This works in tandem with your loaded adapter to steer the model's behavior.
 
-### 4. Inference Parameters
+### 4. Thinking with Adapters
+- An adapter can only think if its training replies show it how. Put the reasoning inside the reply:
+    ```json
+    {"prompt": "Hello", "response": "<think>A visitor greets me. I shall welcome them.</think>Greetings, seeker of truth."}
+    ```
+- Train on replies like these (see `datasets/tesla_thinking.jsonl`) and the adapter is recorded as a **thinking adapter**. With thinking on, it reasons in its own trained voice and no instructions are injected.
+- Adapters trained on plain replies keep thinking locked off, because they would stop after the reasoning.
+- Use thinking in all examples or none. The Train page warns when a dataset mixes both.
+- For adapters trained outside the app, tick **Trained with `<think>` examples** when applying them.
+
+### 5. Watching a Model Load
+- While a model loads, a panel under the model selector shows each step: checking files, downloading, loading the tokenizer, loading weights, and moving to the device.
+- Downloads show size, speed and time remaining. The model list shows each model's size on disk, and a pasted Hugging Face ID shows how much will be downloaded before you start.
+- **Activity log** in the same panel lists what the backend did, including errors.
+
+- **Cancel download** stops a download in progress, and the trash icon in the model list deletes a downloaded model from disk.
+
+### 6. Hugging Face Access Token
+- Gated and private models need a token. Add one under **Settings → Hugging Face access**; create it with read access at `huggingface.co/settings/tokens`.
+- The token is checked with Hugging Face, saved where the `hf` command-line tool keeps it, and never shown in the app again.
+- If a download is slow and no token is set, the progress panel suggests adding one, because Hugging Face gives anonymous downloads lower rate limits.
+
+### 7. Inference Parameters
 In the Chat **Configuration** panel you can tune how the model generates text; changes apply automatically. Use the **Guide** section for full descriptions.
 
 | Parameter | What it does |

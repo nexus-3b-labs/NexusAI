@@ -18,7 +18,13 @@ import os
 import gc
 import json
 import asyncio
+import shutil
+import tempfile
+import fnmatch
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from huggingface_hub import HfApi, get_token, login, logout, snapshot_download, try_to_load_from_cache
+from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
 
 # Import the training module (Make sure dependencies are installed)
 try:
@@ -62,14 +68,25 @@ class EngineState:
         self.model_name = None
         self.adapter_loaded = False
         self.active_adapter = None
+        # True when the active adapter was trained on responses with their own <think> block
+        self.adapter_supports_thinking = False
         # Default system prompt
         self.system_prompt = DEFAULT_SYSTEM_PROMPT
 
         
         # Loading state
-        self.loading_status = "idle" # idle, downloading, loading, ready, error
+        self.loading_status = "idle" # idle, starting, downloading, loading, ready, error
         self.loading_progress = 0.0 # 0-100
         self.loading_error = ""
+        # Detail behind loading_status, so the UI can show what is actually happening
+        self.load = _fresh_load()
+        # Recent backend activity (model loading, training), newest last
+        self.log = deque(maxlen=80)
+        # Set by the cancel endpoint; the download loop checks it
+        self.cancel_download = threading.Event()
+        # Hugging Face token status, refreshed by _check_hf_token (the token is never stored here)
+        self.hf_token_valid = False
+        self.hf_username = None
         
         # Settings
         # Default to 'models' directory in the current working directory
@@ -91,6 +108,249 @@ def _detect_device():
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+# Steps of a model load, in order. loading_status stays coarse; the stage is precise.
+LOAD_STAGES = ["checking", "downloading", "tokenizer", "weights", "device"]
+
+
+def _fresh_load(model_id=None):
+    return {
+        "model": model_id,
+        "stage": None,            # one of LOAD_STAGES while loading
+        "stage_started": 0.0,
+        "started": time.time(),
+        "failed_stage": None,
+        "download": {
+            "needed": False, "offline": False, "downloaded": 0, "total": 0, "speed": 0.0, "eta": None,
+            # True when the download is slow and no Hugging Face token is set
+            "slow_without_token": False,
+        },
+    }
+
+
+def _log(message):
+    """Records a line in the activity log shown in the UI, and prints it."""
+    print(message)
+    state.log.append({"time": time.time(), "message": message})
+
+
+def _set_stage(stage, progress, message):
+    state.load["stage"] = stage
+    state.load["stage_started"] = time.time()
+    state.loading_progress = progress
+    _log(message)
+
+
+def _format_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _dir_size(path, follow_links=True):
+    """Bytes of the files under path, counting each underlying file once.
+
+    The Hugging Face cache links files in two ways: snapshots/ links into the model's
+    blobs/, and newer versions link those blobs into a store shared by the whole cache.
+    follow_links=True resolves both, which gives a model's real size. follow_links=False
+    counts only real files, which is what a whole-cache total needs.
+    """
+    total = 0
+    seen = set()
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            full = os.path.join(root, name)
+            try:
+                if not follow_links and os.path.islink(full):
+                    continue
+                st = os.stat(full)
+            except OSError:
+                continue  # broken link or file removed mid-walk
+            key = (st.st_dev, st.st_ino)
+            if key not in seen:
+                seen.add(key)
+                total += st.st_size
+    return total
+
+
+def _repo_cache_path(model_id):
+    return os.path.join(state.cache_dir, "models--" + model_id.replace("/", "--"))
+
+
+def _plan_download(model_id):
+    """Works out which files a load needs and how many bytes are not in the cache yet.
+
+    Returns (patterns, total_bytes, missing_bytes). Needs the network; callers fall
+    back to the cache when it fails.
+    """
+    info = HfApi().model_info(model_id, files_metadata=True)
+    files = [(f.rfilename, f.size or 0) for f in info.siblings]
+    # Prefer safetensors; skip other weight formats (GGUF, ONNX, ...) we never load
+    weights = "*.safetensors" if any(n.endswith(".safetensors") for n, _ in files) else "*.bin"
+    patterns = ["*.json", "*.txt", "*.model", "*.jinja", "*.py", weights]
+    wanted = [(n, size) for n, size in files if any(fnmatch.fnmatch(n, p) for p in patterns)]
+    missing = [
+        (n, size) for n, size in wanted
+        if not isinstance(try_to_load_from_cache(model_id, n, cache_dir=state.cache_dir), str)
+    ]
+    return patterns, sum(size for _, size in wanted), sum(size for _, size in missing)
+
+
+def _blob_links(repo_path):
+    """Files outside a model's folder that its blobs link to (the cache's shared blob store)."""
+    targets = set()
+    blobs = os.path.join(repo_path, "blobs")
+    if os.path.isdir(blobs):
+        for name in os.listdir(blobs):
+            full = os.path.join(blobs, name)
+            if os.path.islink(full):
+                targets.add(os.path.realpath(full))
+    return targets
+
+
+def _delete_model_files(model_id):
+    """Removes a model's folder from the cache and returns the bytes freed.
+
+    Newer huggingface_hub versions keep large files in a store shared by every model in
+    the cache, so those are removed too, unless another model still links to them.
+    """
+    cache = os.path.realpath(state.cache_dir)
+    repo = os.path.realpath(_repo_cache_path(model_id))
+    # Only ever delete a model folder that sits directly inside the cache folder
+    if os.path.dirname(repo) != cache or not os.path.basename(repo).startswith("models--") or not os.path.isdir(repo):
+        raise FileNotFoundError(model_id)
+
+    before = _dir_size(cache, follow_links=False)
+    shared = {t for t in _blob_links(repo) if t.startswith(cache + os.sep)}
+    shutil.rmtree(repo)
+
+    still_used = set()
+    for folder in os.listdir(cache):
+        if folder.startswith("models--"):
+            still_used |= _blob_links(os.path.join(cache, folder))
+    for target in shared - still_used:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+    return before - _dir_size(cache, follow_links=False)
+
+
+# A download counts as slow below this average speed, once it has run long enough to judge
+SLOW_DOWNLOAD_BYTES_PER_SEC = 1024 * 1024
+SLOW_DOWNLOAD_AFTER_SEC = 15
+
+
+def _slow_without_token(elapsed, speed, remaining):
+    """Hugging Face throttles anonymous downloads harder, so a token is worth suggesting."""
+    return (
+        elapsed >= SLOW_DOWNLOAD_AFTER_SEC
+        and speed < SLOW_DOWNLOAD_BYTES_PER_SEC
+        and remaining > 0
+        and not state.hf_token_valid
+    )
+
+
+def _check_hf_token():
+    """Asks Hugging Face who the saved token belongs to. Updates and returns the token status.
+
+    The token itself never leaves the backend: the UI only learns whether one is set,
+    whether it works, and the account name.
+    """
+    token = get_token()
+    username, valid = None, False
+    if token:
+        try:
+            username = HfApi().whoami(token=token).get("name")
+            valid = True
+        except Exception:
+            valid = False
+    state.hf_token_valid = valid
+    state.hf_username = username
+    return _hf_token_status()
+
+
+def _hf_token_status():
+    return {
+        "configured": get_token() is not None,
+        "valid": state.hf_token_valid,
+        "username": state.hf_username,
+        # A token from the environment cannot be changed from the app
+        "from_environment": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
+    }
+
+
+class DownloadCancelled(Exception):
+    """The user cancelled a model download."""
+
+
+# Runs in its own process so a download can be stopped at any moment by ending the process.
+_DOWNLOAD_SCRIPT = """
+import json, sys
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], cache_dir=sys.argv[2], allow_patterns=json.loads(sys.argv[3]))
+"""
+
+
+def _download_with_progress(model_id, patterns, missing_bytes):
+    """Downloads the model files in a child process, reporting bytes written to the cache.
+
+    Raises DownloadCancelled if the user cancels.
+    """
+    # Measure the whole cache folder: partial files may land in the model's own folder
+    # or in the cache's shared blob store, depending on the huggingface_hub version.
+    def on_disk():
+        return _dir_size(state.cache_dir, follow_links=False)
+
+    baseline = on_disk()
+    download = state.load["download"]
+    download.update({"needed": True, "downloaded": 0, "total": missing_bytes, "speed": 0.0, "eta": None})
+    started = time.time()
+
+    with tempfile.TemporaryFile(mode="w+") as errors:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _DOWNLOAD_SCRIPT, model_id, state.cache_dir, json.dumps(patterns)],
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+        )
+        try:
+            while process.poll() is None:
+                if state.cancel_download.wait(1.0):
+                    raise DownloadCancelled()
+                got = max(0, on_disk() - baseline)
+                elapsed = time.time() - started
+                # Files reach the disk in bursts, so the average since the start is the
+                # steadier figure; an instantaneous rate swings between zero and huge.
+                speed = got / elapsed if elapsed > 0 else 0.0
+                download["downloaded"] = min(got, missing_bytes) if missing_bytes else got
+                download["speed"] = speed
+                remaining = missing_bytes - got
+                # No estimate until there is enough data for it to mean something
+                settled = elapsed >= 3 and got >= 0.01 * missing_bytes
+                download["eta"] = remaining / speed if settled and speed > 0 and remaining > 0 else None
+                if not download["slow_without_token"] and _slow_without_token(elapsed, speed, remaining):
+                    download["slow_without_token"] = True
+                    _log("This download is slow and no Hugging Face token is set. Adding one in Settings raises the rate limits.")
+                if missing_bytes:
+                    # Downloading spans 5% to 70% of the overall bar
+                    state.loading_progress = 5.0 + 65.0 * min(1.0, got / missing_bytes)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+        if process.returncode != 0:
+            errors.seek(0)
+            lines = [line.strip() for line in errors.read().splitlines() if line.strip()]
+            raise RuntimeError(lines[-1] if lines else f"Download failed (exit code {process.returncode}).")
+
+    download["downloaded"] = download["total"]
+    download["speed"], download["eta"] = 0.0, None
 
 
 def _fresh_metrics(status):
@@ -212,9 +472,11 @@ async def get_training_data():
                 "source": entry.get("source", ""),
                 # Same filter train.py applies
                 "usable": score >= 7,
+                "thinking": _has_thinking(entry["response"]),
             })
     eligible = sum(1 for e in entries if e["usable"])
-    return {"total": len(entries), "eligible": eligible, "entries": entries[::-1]}
+    thinking = sum(1 for e in entries if e["usable"] and e["thinking"])
+    return {"total": len(entries), "eligible": eligible, "thinking": thinking, "entries": entries[::-1]}
 
 
 class DeleteExampleRequest(BaseModel):
@@ -268,6 +530,26 @@ class ModelParamsRequest(BaseModel):
 class LoadAdapterRequest(BaseModel):
     system_prompt: str = ""
     adapter_name: str = ""
+    # None = use what training recorded for this adapter; set it to override
+    # (e.g. for adapters trained outside the app).
+    supports_thinking: bool | None = None
+
+
+ADAPTER_META_FILE = getattr(train_module, "ADAPTER_META_FILE", "nexus_adapter.json")
+
+
+def _adapter_meta(adapter_path):
+    """Reads what training recorded about an adapter; empty for adapters without metadata."""
+    try:
+        with open(os.path.join(adapter_path, ADAPTER_META_FILE), "r") as f:
+            meta = json.load(f)
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _has_thinking(response):
+    return "<think>" in response and "</think>" in response
 
 class SystemPromptRequest(BaseModel):
     system_prompt: str = ""
@@ -309,21 +591,30 @@ async def load_adapter_handler(request: LoadAdapterRequest):
         state.model.eval()
         state.adapter_loaded = True
         state.active_adapter = request.adapter_name or "Legacy Adapter"
+        if request.supports_thinking is None:
+            state.adapter_supports_thinking = bool(_adapter_meta(adapter_path).get("supports_thinking", False))
+        else:
+            state.adapter_supports_thinking = request.supports_thinking
         # Keep the current system prompt unless the caller sends a new one
         if request.system_prompt:
             state.system_prompt = request.system_prompt
         print(f"Adapter loaded. System Prompt: {state.system_prompt}")
-        return {"status": "Adapter loaded", "adapter": state.active_adapter}
+        return {
+            "status": "Adapter loaded",
+            "adapter": state.active_adapter,
+            "supports_thinking": state.adapter_supports_thinking,
+        }
     except Exception as e:
         print(f"Error loading adapter: {e}")
         state.adapter_loaded = False
+        state.adapter_supports_thinking = False
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/adapter/list")
 async def list_adapters():
     """Lists available adapters for the CURRENTLY LOADED model."""
     if not state.model_name:
-        return {"adapters": []}
+        return {"adapters": [], "details": []}
     
     print(f"model_name: {state.model_name}")
     model_safe = state.model_name.replace("/", "--")
@@ -336,7 +627,15 @@ async def list_adapters():
         except Exception as e:
              print(f"Error listing adapters: {e}")
         
-    return {"adapters": adapters}
+    details = []
+    for name in sorted(adapters):
+        meta = _adapter_meta(os.path.join(base_path, name))
+        details.append({
+            "name": name,
+            "supports_thinking": bool(meta.get("supports_thinking", False)),
+            "examples": meta.get("examples"),
+        })
+    return {"adapters": sorted(adapters), "details": details}
 
 
 
@@ -415,6 +714,8 @@ def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, c
             print(f"[TRAIN]: {line}")
             
             # Update status for user feedback based on simple keywords
+            if line.startswith(("Loaded ", "Training Error:", "Error:", "No training data", "Training Complete", "Warning:")) or "examples include <think>" in line:
+                 _log(f"Training: {line}")
             if "Loading Model" in line:
                  state.metrics["status"] = "Loading Model..."
             elif "Tokenizing" in line:
@@ -446,54 +747,101 @@ def real_training_loop(model_id, adapter_name="nexus_adapter", data_path=None, c
 # --- Endpoints ---
 
 def _background_model_load(model_id: str):
-    """Background task to load model."""
+    """Loads a model on the model thread, reporting each stage as it goes."""
     global state
+    started = time.time()
     try:
-        print(f"Starting background load for {model_id}")
-        state.loading_status = "downloading"
-        state.loading_progress = 10.0
-        
         device = _detect_device()
 
         # A new base model replaces whatever was loaded, including its adapter
         state.model = None
+        state.tokenizer = None
         state.model_name = None
         state.adapter_loaded = False
         state.active_adapter = None
+        state.adapter_supports_thinking = False
+        gc.collect()
 
-        state.loading_progress = 20.0
-        
-        # Load Tokenizer
-        print(f"Loading tokenizer (cache: {state.cache_dir})...")
+        _check_hf_token()
+
+        # 1. What do we need, and how much of it is already on disk?
+        _set_stage("checking", 2.0, f"Checking which files {model_id} needs...")
+        state.loading_status = "downloading"
+        try:
+            patterns, total_bytes, missing_bytes = _plan_download(model_id)
+        except GatedRepoError:
+            raise RuntimeError(
+f"{model_id} is a gated model. Accept its terms on its huggingface.co page, "
+                "then add your Hugging Face access token in Settings."
+            )
+        except RepositoryNotFoundError:
+            # Local folders and already-cached private models can still load; anything else is a bad ID
+            if not os.path.isdir(model_id) and not os.path.isdir(_repo_cache_path(model_id)):
+                raise RuntimeError(
+                    f"{model_id} was not found on Hugging Face. Check the ID (org/model). "
+                    "If it is a private model, add your Hugging Face access token in Settings."
+                )
+            patterns, total_bytes, missing_bytes = None, 0, 0
+        except Exception as e:
+            # Offline or the Hub is unreachable: carry on if the cache can serve the model
+            patterns, total_bytes, missing_bytes = None, 0, 0
+            state.load["download"]["offline"] = True
+            _log(f"Could not reach Hugging Face ({type(e).__name__}); trying the local cache.")
+
+        # 2. Download whatever is missing
+        if missing_bytes > 0:
+            _set_stage(
+                "downloading", 5.0,
+                f"Downloading {_format_bytes(missing_bytes)} of {_format_bytes(total_bytes)} to {state.cache_dir}",
+            )
+            _download_with_progress(model_id, patterns, missing_bytes)
+            _log("Download complete.")
+        elif patterns is not None:
+            _log(f"All files already downloaded ({_format_bytes(total_bytes)}).")
+
+        # 3. Tokenizer
+        state.loading_status = "loading"
+        _set_stage("tokenizer", 72.0, "Loading tokenizer...")
         state.tokenizer = AutoTokenizer.from_pretrained(
-            model_id, 
+            model_id,
             cache_dir=state.cache_dir,
             trust_remote_code=True
         )
-        state.loading_progress = 40.0
-        
-        # Load Model
-        print(f"Loading model on {device} (cache: {state.cache_dir})...")
-        state.loading_status = "loading"
-        state.model = AutoModelForCausalLM.from_pretrained(
-            model_id, 
+
+        # 4. Weights into memory
+        _set_stage("weights", 78.0, "Loading weights into memory...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
             torch_dtype=torch.float16 if device != "cpu" else torch.float32,
             cache_dir=state.cache_dir,
             trust_remote_code=True
         )
-        # Load on CPU, then move in one step: newer transformers copies weights to the
-        # device from several threads at once, which hangs on MPS.
-        state.model.to(device)
+
+        # 5. Onto the device. Load on CPU, then move in one step: newer transformers copies
+        # weights to the device from several threads at once, which hangs on MPS.
+        _set_stage("device", 92.0, f"Moving model to {device}...")
+        model.to(device)
+        state.model = model
         state.model_name = model_id
-        
+
+        state.load["stage"] = None
         state.loading_progress = 100.0
         state.loading_status = "ready"
-        print(f"Model {model_id} ready.")
-        
+        _log(f"{model_id} is ready ({time.time() - started:.0f}s).")
+
+    except DownloadCancelled:
+        got = state.load["download"]["downloaded"]
+        state.load = _fresh_load()
+        state.loading_progress = 0.0
+        state.loading_status = "idle"
+        _log(f"Download of {model_id} cancelled after {_format_bytes(got)}.")
+
     except Exception as e:
-        print(f"Error in background load: {e}")
+        state.load["failed_stage"] = state.load["stage"]
+        state.load["stage"] = None
         state.loading_status = "error"
         state.loading_error = str(e)
+        _log(f"Model load failed: {e}")
 
 @app.post("/v1/model/load")
 async def load_model_handler(request: LoadModelRequest):
@@ -505,9 +853,105 @@ async def load_model_handler(request: LoadModelRequest):
     state.loading_status = "starting"
     state.loading_progress = 0.0
     state.loading_error = ""
+    state.load = _fresh_load(request.model_id)
+    state.cancel_download.clear()
     
     model_executor.submit(_background_model_load, request.model_id)
     return {"status": "Loading started", "model": request.model_id}
+
+@app.post("/v1/model/load/cancel")
+async def cancel_model_download():
+    """Stops a model download that is in progress. Only the download step can be cancelled."""
+    busy = state.loading_status in ("starting", "downloading", "loading")
+    if not busy or state.load["stage"] != "downloading":
+        raise HTTPException(status_code=409, detail="No download is in progress.")
+    state.cancel_download.set()
+    return {"status": "Cancelling download", "model": state.load["model"]}
+
+
+class HfTokenRequest(BaseModel):
+    token: str
+
+
+@app.get("/v1/settings/hf_token")
+async def get_hf_token_status():
+    """Whether a Hugging Face token is set and working. Never returns the token."""
+    return await asyncio.to_thread(_check_hf_token)
+
+
+@app.post("/v1/settings/hf_token")
+async def set_hf_token(request: HfTokenRequest):
+    """Validates a Hugging Face access token and saves it where huggingface_hub keeps it."""
+    token = request.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Paste a token first.")
+    try:
+        await asyncio.to_thread(lambda: HfApi().whoami(token=token))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Hugging Face rejected this token. Check that it was copied in full and has not been revoked.")
+    # Same place `hf auth login` writes to, so downloads (and the hf CLI) pick it up
+    await asyncio.to_thread(login, token=token, add_to_git_credential=False)
+    status = await asyncio.to_thread(_check_hf_token)
+    _log(f"Hugging Face token saved for {status['username']}.")
+    return status
+
+
+@app.post("/v1/settings/hf_token/remove")
+async def remove_hf_token():
+    """Removes the saved Hugging Face token from this machine."""
+    await asyncio.to_thread(logout)
+    status = await asyncio.to_thread(_check_hf_token)
+    _log("Hugging Face token removed.")
+    return status
+
+
+class DeleteModelRequest(BaseModel):
+    model_id: str
+
+
+@app.post("/v1/model/delete")
+async def delete_model(request: DeleteModelRequest):
+    """Deletes a downloaded model from the cache folder. This cannot be undone."""
+    model_id = request.model_id
+    if model_id == state.model_name:
+        raise HTTPException(status_code=409, detail="This model is loaded. Eject it first.")
+    if state.loading_status in ("starting", "downloading", "loading") and state.load["model"] == model_id:
+        raise HTTPException(status_code=409, detail="This model is being loaded. Wait for it to finish or cancel the download.")
+    if state.is_training and state.metrics.get("model") == model_id:
+        raise HTTPException(status_code=409, detail="This model is being used for training.")
+    try:
+        freed = await asyncio.to_thread(_delete_model_files, model_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"{model_id} is not in the model folder.")
+    _log(f"Deleted {model_id} from disk ({_format_bytes(freed)} freed).")
+    return {"status": "Model deleted", "model": model_id, "freed_bytes": freed}
+
+
+def _load_report():
+    """The load detail for the UI, with elapsed times computed server-side."""
+    load = state.load
+    now = time.time()
+    busy = state.loading_status in ("starting", "downloading", "loading")
+    return {
+        "model": load["model"],
+        "stage": load["stage"],
+        "stages": LOAD_STAGES,
+        "failed_stage": load["failed_stage"],
+        "stage_elapsed": now - load["stage_started"] if busy and load["stage"] else 0.0,
+        "elapsed": now - load["started"] if busy else 0.0,
+        "download": load["download"],
+    }
+
+
+@app.get("/v1/model/info")
+async def model_info(model_id: str):
+    """Size of a model and how much of it would have to be downloaded."""
+    try:
+        _patterns, total_bytes, missing_bytes = await asyncio.to_thread(_plan_download, model_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Could not look up {model_id}: {type(e).__name__}")
+    return {"model": model_id, "total_bytes": total_bytes, "missing_bytes": missing_bytes}
+
 
 @app.get("/v1/model/status")
 async def get_model_status():
@@ -515,6 +959,8 @@ async def get_model_status():
         "status": state.loading_status,
         "progress": state.loading_progress,
         "error": state.loading_error,
+        "load": _load_report(),
+        "log": list(state.log)[-50:],
         "current_model": state.model_name,
         "device": _detect_device(),
         "system_prompt": state.system_prompt,
@@ -522,7 +968,9 @@ async def get_model_status():
         "active_adapter": state.active_adapter,
         "adapter_loaded": state.adapter_loaded,
         # Thinking mode is disabled when an adapter is loaded (adapters aren't trained on <think> format)
-        "thinking_supported": not state.adapter_loaded,
+        "adapter_supports_thinking": state.adapter_supports_thinking,
+        # Thinking is available on the base model and on adapters trained with <think> examples
+        "thinking_supported": not state.adapter_loaded or state.adapter_supports_thinking,
     }
 
 @app.post("/v1/model/unload")
@@ -537,6 +985,7 @@ async def unload_model():
     state.model_name = None
     state.adapter_loaded = False
     state.active_adapter = None
+    state.adapter_supports_thinking = False
     state.loading_status = "idle"
     state.loading_progress = 0.0
     
@@ -585,6 +1034,7 @@ async def unload_adapter_handler():
         state.model.eval()
         state.adapter_loaded = False
         state.active_adapter = None
+        state.adapter_supports_thinking = False
         print("Adapter unloaded. Reverted to base model.")
         return {"status": "Adapter unloaded"}
     except Exception as e:
@@ -605,24 +1055,23 @@ async def get_settings():
 
 @app.get("/v1/model/list")
 async def list_models():
-    """Lists downloaded models in the cache directory."""
+    """Lists downloaded models in the cache directory, with their size on disk."""
     if not state.cache_dir or not os.path.exists(state.cache_dir):
-        return {"models": []}
+        return {"models": [], "details": []}
     
-    models = []
+    details = []
     try:
-        for folder in os.listdir(state.cache_dir):
+        for folder in sorted(os.listdir(state.cache_dir)):
             if folder.startswith("models--"):
                 # Parse "models--org--repo" -> "org/repo"
                 parts = folder.split("--")
                 if len(parts) >= 3:
-                    org = parts[1]
-                    repo = parts[2]
-                    models.append(f"{org}/{repo}")
+                    size = await asyncio.to_thread(_dir_size, os.path.join(state.cache_dir, folder))
+                    details.append({"id": f"{parts[1]}/{parts[2]}", "size_bytes": size})
     except Exception as e:
         print(f"Error listing models: {e}")
         
-    return {"models": models}
+    return {"models": [d["id"] for d in details], "details": details}
 
 @app.post("/v1/parameters/update")
 async def update_parameters(request: ModelParamsRequest):
@@ -666,11 +1115,18 @@ def _generate_reply(request: ChatRequest):
         if state.tokenizer.chat_template:
             messages = [{"role": "system", "content": state.system_prompt}]
             
-            # When an adapter is loaded, skip thinking injection — adapters are trained
-            # on direct prompt→response without <think> tags, so they stop after </think>.
-            use_thinking = request.enable_thinking and not state.adapter_loaded
-            
-            if use_thinking:
+            # Three cases:
+            #  - base model: we ask for <think> reasoning with instructions and a one-shot example
+            #  - adapter trained with <think> examples: it writes its own reasoning, so the
+            #    prompt is left untouched (injected instructions would override its voice)
+            #  - any other adapter: direct replies only; it was never shown <think> and
+            #    would stop after </think>
+            adapter_thinks = state.adapter_loaded and state.adapter_supports_thinking
+            use_thinking = request.enable_thinking and (not state.adapter_loaded or adapter_thinks)
+
+            if use_thinking and adapter_thinks:
+                pass
+            elif use_thinking:
                 messages[0]["content"] += "\n\nYou MUST begin by reasoning step-by-step inside <think>...</think> tags. Do NOT speak to the user inside the tags. usage: <think>internal thought</think> final response"
                 # One-shot example to guide the model
                 messages.append({"role": "user", "content": "Hello"})

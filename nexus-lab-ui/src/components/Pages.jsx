@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sun, Moon } from 'lucide-react';
+import { Sun, Moon, CheckCircle2, AlertTriangle, KeyRound } from 'lucide-react';
 import { Button, Card, Label, inputClass } from './ui';
 
 function Segmented({ value, options, onChange, label }) {
@@ -20,13 +20,67 @@ function Segmented({ value, options, onChange, label }) {
   );
 }
 
-export function SettingsView({ cacheDir, onSaveCacheDir, theme, onTheme, zoom, onZoom, modelCount }) {
+function HfTokenCard({ hfToken, onSave, onRemove }) {
+  const [token, setToken] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    if (await onSave(token)) setToken('');
+    setSaving(false);
+  };
+
+  return (
+    <Card title="Hugging Face access">
+      <div className="mb-3 flex items-start gap-2 text-sm">
+        {hfToken.configured && hfToken.valid ? (
+          <><CheckCircle2 size={16} className="mt-0.5 shrink-0 text-good" /><span className="text-ink">Signed in as <span className="font-mono">{hfToken.username}</span>. Gated models you have access to can be downloaded.</span></>
+        ) : hfToken.configured ? (
+          <><AlertTriangle size={16} className="mt-0.5 shrink-0 text-warn" /><span className="text-ink">A token is saved, but Hugging Face rejected it. It may be expired or revoked, or you may be offline. Paste a new one below.</span></>
+        ) : (
+          <><KeyRound size={16} className="mt-0.5 shrink-0 text-muted" /><span className="text-muted">No token set. Public models still download, but gated models will not, and downloads have lower rate limits.</span></>
+        )}
+      </div>
+
+      {hfToken.from_environment ? (
+        <p className="text-xs text-muted">The token comes from the <code className="font-mono">HF_TOKEN</code> environment variable, so it has to be changed there.</p>
+      ) : (
+        <>
+          <Label>{hfToken.configured ? 'Replace access token' : 'Access token'}</Label>
+          <div className="flex gap-2">
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && token.trim()) save(); }}
+              placeholder="hf_…"
+              autoComplete="off"
+              spellCheck={false}
+              aria-label="Hugging Face access token"
+              className={`${inputClass} font-mono text-[13px]`}
+            />
+            <Button variant={token.trim() ? 'primary' : 'secondary'} disabled={!token.trim() || saving} onClick={save}>
+              {saving ? 'Checking…' : 'Save'}
+            </Button>
+            {hfToken.configured && <Button variant="danger" onClick={onRemove}>Remove</Button>}
+          </div>
+        </>
+      )}
+      <p className="mt-2 text-xs text-muted">
+        Create a token with read access at <span className="font-mono">huggingface.co/settings/tokens</span>. For a gated model, also accept its terms on the model's page.
+        The token is checked with Hugging Face, saved on this machine where the <code className="font-mono">hf</code> command-line tool keeps it, and never shown again here.
+      </p>
+    </Card>
+  );
+}
+
+export function SettingsView({ cacheDir, onSaveCacheDir, theme, onTheme, zoom, onZoom, modelCount, hfToken, onSaveHfToken, onRemoveHfToken }) {
   const [draft, setDraft] = useState(cacheDir);
   const dirty = draft.trim() !== (cacheDir || '').trim();
 
   return (
     <div className="h-full flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-2xl space-y-4 px-4 py-6">
+      <div className="w-full max-w-2xl space-y-4 p-4">
         <h1 className="text-xl font-semibold text-ink">Settings</h1>
 
         <Card title="Model storage" aside={<span>{modelCount} downloaded {modelCount === 1 ? 'model' : 'models'} found</span>}>
@@ -45,6 +99,8 @@ export function SettingsView({ cacheDir, onSaveCacheDir, theme, onTheme, zoom, o
             Models are downloaded to and listed from this folder. Point it at <code className="font-mono">~/.cache/huggingface/hub</code> to reuse models you already have. This resets when the backend restarts.
           </p>
         </Card>
+
+        <HfTokenCard hfToken={hfToken} onSave={onSaveHfToken} onRemove={onRemoveHfToken} />
 
         <Card title="Appearance">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -90,7 +146,7 @@ const PARAM_HELP = [
 export function HelpView({ onGo }) {
   return (
     <div className="h-full flex-1 overflow-y-auto">
-      <div className="mx-auto w-full max-w-2xl space-y-4 px-4 py-6">
+      <div className="w-full max-w-2xl space-y-4 p-4">
         <h1 className="text-xl font-semibold text-ink">Guide</h1>
 
         <Card title="How the lab fits together">
@@ -121,7 +177,12 @@ export function HelpView({ onGo }) {
           <p className="text-sm leading-relaxed text-muted">
             A persona has two parts. The <strong className="text-ink">adapter</strong> changes how the model writes: tone, vocabulary and sentence shape learned from your data.
             The <strong className="text-ink">system prompt</strong> states who the model is and applies to every message. Use both together for the strongest effect.
-            Thinking mode is disabled while an adapter is active, because adapters are trained on direct replies.
+          </p>
+          <p className="mt-3 text-sm leading-relaxed text-muted">
+            <strong className="text-ink">Thinking with adapters.</strong> An adapter can only think if its training replies showed it how, for example{' '}
+            <code className="font-mono text-ink">{'<think>They greet me warmly.</think>Ahoy, matey!'}</code>.
+            Train on such replies and the adapter is marked as a thinking adapter: with thinking on, it reasons in its own trained voice and no instructions are injected.
+            Adapters trained on plain replies keep thinking locked off, because they would stop after the reasoning and give no answer.
           </p>
         </Card>
 

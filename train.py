@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 from datasets import Dataset
 from transformers import (
@@ -19,6 +20,8 @@ DATA_FILE = "training_data.jsonl"
 OUTPUT_DIR = "nexus_adapters"
 MAX_LENGTH = 512
 NUM_EPOCHS = 3
+# Written next to the adapter weights so the app knows how the adapter was trained
+ADAPTER_META_FILE = "nexus_adapter.json"
 
 class ProgressCallback(TrainerCallback):
     """Custom callback to report metrics to the backend state."""
@@ -75,12 +78,22 @@ def load_data(data_path):
     print(f"Loaded {len(data)} high-quality training examples.")
     return data
 
-def format_example(tokenizer, prompt, response):
-    """Returns (prefix, full_text) in the same chat format the model sees at inference time."""
+def has_thinking(response):
+    """True if a training response carries its own <think>...</think> reasoning."""
+    return "<think>" in response and "</think>" in response
+
+def format_example(tokenizer, prompt, response, thinking=False):
+    """Returns (prefix, full_text) in the same chat format the model sees at inference time.
+
+    thinking=False: the adapter answers directly, so the prompt ends the way a
+    "thinking off" prompt does (Qwen3 pre-fills an empty think block).
+    thinking=True: the responses contain their own <think> block, so the prompt is
+    left open for the adapter to write it.
+    """
     if tokenizer.chat_template:
         prefix = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
-            enable_thinking=False,  # adapters answer directly; matches inference with an adapter loaded
+            enable_thinking=thinking,
         )
     else:
         prefix = f"<|user|>\n{prompt}<|endoftext|>\n<|assistant|>\n"
@@ -94,6 +107,14 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
     if not data:
         print("No training data found or loaded.")
         return False
+
+    # An adapter learns to think only if its examples show it how
+    thinking_examples = sum(1 for d in data if has_thinking(d["response"]))
+    supports_thinking = thinking_examples > 0
+    if supports_thinking:
+        print(f"{thinking_examples} of {len(data)} examples include <think> reasoning: training a thinking adapter.")
+        if thinking_examples < len(data):
+            print("Warning: the dataset mixes thinking and direct examples; the adapter may be inconsistent.")
 
     # Convert to HuggingFace Dataset
     dataset = Dataset.from_list(data)
@@ -125,7 +146,7 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
         def tokenize_function(examples):
             prefixes, texts = [], []
             for prompt, response in zip(examples["prompt"], examples["response"]):
-                prefix, text = format_example(tokenizer, prompt, response)
+                prefix, text = format_example(tokenizer, prompt, response, thinking=supports_thinking)
                 prefixes.append(prefix)
                 texts.append(text)
             full_enc = tokenizer(
@@ -226,6 +247,13 @@ def run_training(model_id=DEFAULT_MODEL_ID, data_path=DATA_FILE, output_dir=OUTP
 
         print(f"Saving adapters to {output_dir}...")
         model.save_pretrained(output_dir)
+        with open(os.path.join(output_dir, ADAPTER_META_FILE), "w") as f:
+            json.dump({
+                "base_model": model_id,
+                "examples": len(data),
+                "thinking_examples": thinking_examples,
+                "supports_thinking": supports_thinking,
+            }, f, indent=2)
         print("Training Complete!")
         return True
 
